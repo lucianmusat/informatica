@@ -1,4 +1,5 @@
 import weaviate
+from weaviate.classes.config import Property, DataType
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
@@ -66,6 +67,8 @@ def main():
     st.write(css, unsafe_allow_html=True)
     weaviate_client = weaviate.connect_to_local()
 
+    WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
+
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
@@ -75,10 +78,15 @@ def main():
     if "user_input" not in st.session_state:
         st.session_state.user_input = ""
 
-    # TODO: reconnect to weaviate and hook it back to previous embeddings
+    if not weaviate_client.collections.exists(WEAVIATE_CLASS_NAME):
+        weaviate_client.collections.create(WEAVIATE_CLASS_NAME,
+                                             properties = [
+                                                 Property(name="title", data_type=DataType.TEXT),
+                                                 Property(name="body", data_type=DataType.TEXT),
+                                             ])
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    vectorstore = WeaviateVectorStore(client=weaviate_client, index_name=WEAVIATE_CLASS_NAME, text_key="text", embedding=embeddings)
     if st.session_state.conversation is None:
-        embeddings = OllamaEmbeddings(model="nomic-embed-text")
-        vectorstore = WeaviateVectorStore(client=weaviate_client, index_name=None, text_key="anonymous", embedding=embeddings)
         st.session_state.conversation = get_conversation_chain(vectorstore)
 
     st.header("Informatica :: Converse with documents :books:")
@@ -95,8 +103,7 @@ def main():
         if st.button("Process"):
             with st.spinner("Processing"):
                 text_chunks = get_text_chunks(pdf_extract_text(pdf_files))
-                embeddings = OllamaEmbeddings(model="nomic-embed-text",)
-                vectorstore = WeaviateVectorStore.from_texts(text_chunks, embeddings, client=weaviate_client)
+                vectorstore.add_texts(text_chunks)
                 st.session_state.conversation = get_conversation_chain(vectorstore)
                 st.session_state.files_processed = True
 
