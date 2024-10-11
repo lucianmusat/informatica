@@ -7,6 +7,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_weaviate.vectorstores import WeaviateVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from weaviate.exceptions import WeaviateConnectionError
 from html_templates import css, bot_template, user_template
 
 
@@ -51,7 +52,11 @@ def handle_userinput(user_input: str) -> None:
             "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
         return
     with st.spinner('Processing your question...'):
-        response = st.session_state.conversation({'question': user_input})
+        try:
+            response = st.session_state.conversation({'question': user_input})
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}", icon="⚠️")
+            return
         st.session_state.chat_history = response['chat_history']
 
     # Reverse the chat history to display the newest messages first
@@ -68,7 +73,11 @@ def handle_userinput(user_input: str) -> None:
 def main():
     st.set_page_config(page_title="Converse with documents", page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
-    weaviate_client = weaviate.connect_to_local()
+    try:
+        weaviate_client = weaviate.connect_to_local()
+    except WeaviateConnectionError:
+        st.error('Cannot connect to the database!', icon="🚨")
+        return
 
     WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
 
@@ -95,7 +104,6 @@ def main():
     st.header("Informatica :: Converse with documents :books:")
 
     question = st.text_input("Message:", value=st.session_state.user_input)
-                                         # disabled=not st.session_state.files_processed)
     if question:
         st.session_state.user_input = question
         handle_userinput(question)
