@@ -129,7 +129,7 @@ def main():
     st.set_page_config(page_title="Informatica | Converse with documents", page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
     try:
-        weaviate_url = os.getenv('WEAVIATE_URL', 'http://weaviate:8080')
+        weaviate_url = os.getenv('WEAVIATE_URL', 'weaviate')
         weaviate_client = weaviate.connect_to_custom(
                 http_host = weaviate_url,
                 http_port = 8080,
