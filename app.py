@@ -1,3 +1,4 @@
+import os
 import weaviate
 import traceback
 import streamlit as st
@@ -38,9 +39,13 @@ def get_text_chunks(text) -> list[str]:
 
 
 def get_conversation_chain(vectorstore):
+    ollama_host = os.getenv('OLLAMA_SERVICE_HOST', 'ollama.default.svc.cluster.local')
+    ollama_port = os.getenv('OLLAMA_SERVICE_PORT', '11434')
+    ollama_url = f"http://{ollama_host}:{ollama_port}"
     llm = ChatOllama(
         model="mistral",
         temperature=0,
+        base_url=ollama_url
     )
     memory = ConversationBufferMemory(
         memory_key='chat_history', return_messages=True)
@@ -121,10 +126,18 @@ def get_all_files(client, class_name: str) -> list[str]:
 
 
 def main():
-    st.set_page_config(page_title="Converse with documents", page_icon=":books:")
+    st.set_page_config(page_title="Informatica | Converse with documents", page_icon=":books:")
     st.write(css, unsafe_allow_html=True)
     try:
-        weaviate_client = weaviate.connect_to_local()
+        weaviate_url = os.getenv('WEAVIATE_URL', 'http://weaviate:8080')
+        weaviate_client = weaviate.connect_to_custom(
+                http_host = weaviate_url,
+                http_port = 8080,
+                http_secure = False,
+                grpc_host = weaviate_url,
+                grpc_port = 50051,
+                grpc_secure = False
+        )
     except WeaviateConnectionError:
         st.error('Cannot connect to the database!', icon="🚨")
         return
