@@ -53,8 +53,10 @@ def handle_userinput(user_input: str) -> None:
     with st.spinner('Processing your question...'):
         response = st.session_state.conversation({'question': user_input})
         st.session_state.chat_history = response['chat_history']
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
+
+    # Reverse the chat history to display the newest messages first
+    for i, message in enumerate(reversed(st.session_state.chat_history)):
+        if i % 2 != 0:
             st.write(user_template.replace(
                 "{{MSG}}", message.content), unsafe_allow_html=True)
         else:
