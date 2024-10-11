@@ -62,6 +62,7 @@ def handle_userinput(user_input: str) -> None:
         else:
             st.write(bot_template.replace(
                 "{{MSG}}", message.content), unsafe_allow_html=True)
+    st.session_state.user_input = ""
 
 
 def main():
