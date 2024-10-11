@@ -15,6 +15,9 @@ from weaviate.classes.query import Filter
 from html_templates import css, bot_template, user_template
 
 WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
+LLM_MODEL = "mistral"
+EMBEDDER_MODEL = "nomic-embed-text"
+OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
 
 def pdf_extract_text(pdf_files: list) -> dict:
     pdf_texts = {}
@@ -39,13 +42,10 @@ def get_text_chunks(text) -> list[str]:
 
 
 def get_conversation_chain(vectorstore):
-    ollama_host = os.getenv('OLLAMA_SERVICE_HOST', 'ollama.default.svc.cluster.local')
-    ollama_port = os.getenv('OLLAMA_SERVICE_PORT', '11434')
-    ollama_url = f"http://{ollama_host}:{ollama_port}"
     llm = ChatOllama(
-        model="mistral",
+        model=LLM_MODEL,
         temperature=0,
-        base_url=ollama_url
+        base_url=OLLAMA_URL
     )
     memory = ConversationBufferMemory(
         memory_key='chat_history', return_messages=True)
@@ -160,7 +160,7 @@ def main():
                                                Property(name="fileName", data_type=DataType.TEXT)
                                            ])
 
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    embeddings = OllamaEmbeddings(base_url=OLLAMA_URL, model=EMBEDDER_MODEL)
     vectorstore = WeaviateVectorStore(client=weaviate_client, index_name=WEAVIATE_CLASS_NAME, text_key="text",
                                       embedding=embeddings)
 
