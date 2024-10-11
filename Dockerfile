@@ -20,7 +20,7 @@ COPY . /app
 
 EXPOSE 8501
 
-ENV WEAVIATE_URL=http://localhost:8080
+#ENV WEAVIATE_URL=http://localhost:8080
 
 WORKDIR /app
 
