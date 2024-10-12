@@ -18,6 +18,10 @@ WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
 LLM_MODEL = "mistral"
 EMBEDDER_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
+# OLLAMA_URL = "http://localhost:11434"
+WEAVIATE_URL = "weaviate"
+# WEAVIATE_URL = "localhost"
+
 
 def pdf_extract_text(pdf_files: list) -> dict:
     pdf_texts = {}
@@ -126,10 +130,11 @@ def get_all_files(client, class_name: str) -> list[str]:
 
 
 def main():
-    st.set_page_config(page_title="Informatica | Converse with documents", page_icon=":books:")
+    st.set_page_config(page_title="Informatica | Converse with documents",
+                       page_icon=":books:", initial_sidebar_state="collapsed")
     st.write(css, unsafe_allow_html=True)
     try:
-        weaviate_url = os.getenv('WEAVIATE_URL', 'weaviate')
+        weaviate_url = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
         weaviate_client = weaviate.connect_to_custom(
                 http_host = weaviate_url,
                 http_port = 8080,
@@ -167,6 +172,11 @@ def main():
     if st.session_state.conversation is None:
         st.session_state.conversation = get_conversation_chain(vectorstore)
 
+    left_co, cent_co, last_co = st.columns(3)
+    with cent_co:
+        st.image("static/logo.png")
+
+    st.logo("static/logo.png")
     st.header("Informatica :: Converse with documents :books:")
 
     question = st.text_input("Message:", value=st.session_state.user_input)
@@ -182,7 +192,7 @@ def main():
                 store_pdf_content(pdf_extract_text(pdf_files), vectorstore)
                 st.session_state.conversation = get_conversation_chain(vectorstore)
 
-        st.write("Loaded documents")
+        st.write("Available documents")
         for file_name in get_all_files(weaviate_client, WEAVIATE_CLASS_NAME):
             col1, col2 = st.columns([4, 1])
             col1.write(file_name)
