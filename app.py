@@ -13,14 +13,15 @@ from weaviate.classes.config import Property, DataType
 from weaviate.classes.query import Filter
 
 from html_templates import css, bot_template, user_template
+from streamhandler import StreamHandler
 
 WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
 LLM_MODEL = "mistral"
 EMBEDDER_MODEL = "nomic-embed-text"
-OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
-# OLLAMA_URL = "http://localhost:11434"
-WEAVIATE_URL = "weaviate"
-# WEAVIATE_URL = "localhost"
+# OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
+OLLAMA_URL = "http://localhost:11434"
+# WEAVIATE_URL = "weaviate"
+WEAVIATE_URL = "localhost"
 
 
 def pdf_extract_text(pdf_files: list) -> dict:
@@ -49,7 +50,8 @@ def get_conversation_chain(vectorstore):
     llm = ChatOllama(
         model=LLM_MODEL,
         temperature=0,
-        base_url=OLLAMA_URL
+        base_url=OLLAMA_URL,
+        streaming=True
     )
     memory = ConversationBufferMemory(
         memory_key='chat_history', return_messages=True)
@@ -66,23 +68,27 @@ def handle_userinput(user_input: str) -> None:
         st.write(bot_template.replace(
             "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
         return
+
+    st.write(user_template.replace("{{MSG}}", user_input), unsafe_allow_html=True)
+
+    # Create a placeholder for the AI response
+    response_placeholder = st.empty()
+
     with st.spinner('Processing your question...'):
         try:
-            response = st.session_state.conversation({'question': user_input})
+            stream_handler = StreamHandler(response_placeholder)
+
+            # Use the callbacks parameter in the __call__ method
+            response = st.session_state.conversation.__call__(
+                {'question': user_input},
+                callbacks=[stream_handler]
+            )
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}", icon="⚠️")
+            st.error(traceback.format_exc())
             return
-        st.session_state.chat_history = response['chat_history']
 
-    # Reverse the chat history to display the newest messages first
-    for i, message in enumerate(reversed(st.session_state.chat_history)):
-        if i % 2 != 0:
-            st.write(user_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-        else:
-            st.write(bot_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-    st.session_state.user_input = ""
+        st.session_state.chat_history = response['chat_history']
 
 
 def remove_file_and_embeddings(file_name: str, client, class_name: str):
@@ -151,8 +157,6 @@ def main():
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = None
-    if "user_input" not in st.session_state:
-        st.session_state.user_input = ""
     if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = []
 
@@ -179,10 +183,17 @@ def main():
     st.logo("static/logo.png")
     st.header("Informatica :: Converse with documents :books:")
 
-    question = st.text_input("Message:", value=st.session_state.user_input)
+    question = st.text_input("Message:", key="user_input")
     if question:
-        st.session_state.user_input = question
         handle_userinput(question)
+
+    if st.session_state.chat_history:
+        # Exclude the last message pair, because it has been already displayed by the callback
+        for i, message in enumerate(reversed(st.session_state.chat_history[:-2])):
+            if i % 2 == 0:
+                st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            else:
+                st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
 
     with st.sidebar:
         st.subheader("PDFs")

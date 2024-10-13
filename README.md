@@ -23,5 +23,6 @@ Be patient, it's running on a very small server, with an i5 and a tiny 4Gb low p
 
 ## TODO
 
+ - [X] Display LLM answer while it's being generated
  - [ ] Add authentication (I don't want my server to be spammed by randos or bots)
  - [ ] Add multi-tenancy (Each user will only see its own documents)
