@@ -18,10 +18,10 @@ from streamhandler import StreamHandler
 WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
 LLM_MODEL = "mistral"
 EMBEDDER_MODEL = "nomic-embed-text"
-# OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
-OLLAMA_URL = "http://localhost:11434"
-# WEAVIATE_URL = "weaviate"
-WEAVIATE_URL = "localhost"
+OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
+# OLLAMA_URL = "http://localhost:11434"
+WEAVIATE_URL = "weaviate"
+# WEAVIATE_URL = "localhost"
 
 
 def pdf_extract_text(pdf_files: list) -> dict:
@@ -135,23 +135,28 @@ def get_all_files(client, class_name: str) -> list[str]:
         return []
 
 
+def get_weaviate_client():
+    if 'weaviate_client' not in st.session_state:
+        try:
+            weaviate_url = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
+            st.session_state.weaviate_client = weaviate.connect_to_custom(
+                http_host=weaviate_url,
+                http_port=8080,
+                http_secure=False,
+                grpc_host=weaviate_url,
+                grpc_port=50051,
+                grpc_secure=False
+            )
+        except WeaviateConnectionError:
+            st.error('Cannot connect to the database!', icon="🚨")
+            return None
+    return st.session_state.weaviate_client
+
+
 def main():
     st.set_page_config(page_title="Informatica | Converse with documents",
                        page_icon=":books:", initial_sidebar_state="collapsed")
     st.write(css, unsafe_allow_html=True)
-    try:
-        weaviate_url = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
-        weaviate_client = weaviate.connect_to_custom(
-                http_host = weaviate_url,
-                http_port = 8080,
-                http_secure = False,
-                grpc_host = weaviate_url,
-                grpc_port = 50051,
-                grpc_secure = False
-        )
-    except WeaviateConnectionError:
-        st.error('Cannot connect to the database!', icon="🚨")
-        return
 
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
@@ -159,6 +164,11 @@ def main():
         st.session_state.chat_history = None
     if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = []
+
+    weaviate_client = get_weaviate_client()
+    if not weaviate_client:
+        return
+    weaviate_client.connect()
 
     # Create or update schema
     if not weaviate_client.collections.exists(WEAVIATE_CLASS_NAME):
@@ -210,6 +220,8 @@ def main():
             if col2.button("X", key=f"remove_{file_name}"):
                 remove_file_and_embeddings(file_name, weaviate_client, WEAVIATE_CLASS_NAME)
 
+    if st.session_state.get('weaviate_client'):
+        st.session_state.weaviate_client.close()
 
 if __name__ == '__main__':
     main()
