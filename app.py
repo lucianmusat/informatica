@@ -20,7 +20,8 @@ LLM_MODEL = "mistral"
 EMBEDDER_MODEL = "nomic-embed-text"
 OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
 # OLLAMA_URL = "http://localhost:11434"
-WEAVIATE_URL = "weaviate"
+# In k8s, use the service DNS name (not a pod name)
+WEAVIATE_URL = "weaviate.default.svc.cluster.local"
 # WEAVIATE_URL = "localhost"
 
 
@@ -138,14 +139,22 @@ def get_all_files(client, class_name: str) -> list[str]:
 def get_weaviate_client():
     if 'weaviate_client' not in st.session_state:
         try:
-            weaviate_url = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
+            # Use service DNS (FQDN) by default; allow overriding via env.
+            weaviate_host = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
+            weaviate_host = weaviate_host.replace('http://', '').replace('https://', '').strip('/')
+
+            http_port = int(os.getenv('WEAVIATE_HTTP_PORT', '8080'))
+            grpc_port = int(os.getenv('WEAVIATE_GRPC_PORT', '50051'))
+            http_secure = os.getenv('WEAVIATE_HTTP_SECURE', 'false').lower() == 'true'
+            grpc_secure = os.getenv('WEAVIATE_GRPC_SECURE', 'false').lower() == 'true'
+
             st.session_state.weaviate_client = weaviate.connect_to_custom(
-                http_host=weaviate_url,
-                http_port=8080,
-                http_secure=False,
-                grpc_host=weaviate_url,
-                grpc_port=50051,
-                grpc_secure=False
+                http_host=weaviate_host,
+                http_port=http_port,
+                http_secure=http_secure,
+                grpc_host=weaviate_host,
+                grpc_port=grpc_port,
+                grpc_secure=grpc_secure,
             )
         except WeaviateConnectionError:
             st.error('Cannot connect to the database!', icon="🚨")
