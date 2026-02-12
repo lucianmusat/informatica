@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y \
     libffi-dev \
     libssl-dev \
     pkg-config \
+    # deps for pillow (zlib/jpeg)
+    zlib1g-dev \
+    libjpeg62-turbo-dev \
     rustc \
     cargo \
     && rm -rf /var/lib/apt/lists/*
