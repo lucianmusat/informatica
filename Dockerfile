@@ -5,6 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir poetry==1.8.3
