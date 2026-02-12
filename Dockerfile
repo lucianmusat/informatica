@@ -6,9 +6,15 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
     libffi-dev \
+    libssl-dev \
+    pkg-config \
+    rustc \
+    cargo \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir poetry==1.8.3
+# Newer pip helps with PEP517/build deps (esp. cryptography on ARM)
+RUN pip install --no-cache-dir -U pip setuptools wheel \
+  && pip install --no-cache-dir poetry==1.8.3
 
 # Copy only the poetry files first to leverage Docker layer caching
 COPY pyproject.toml poetry.lock ./
