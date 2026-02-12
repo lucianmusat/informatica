@@ -7,8 +7,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sSL https://install.python-poetry.org | python3 -
-ENV PATH="/root/.local/bin:$PATH"
+RUN pip install --no-cache-dir poetry==1.8.3
 
 # Copy only the poetry files first to leverage Docker layer caching
 COPY pyproject.toml poetry.lock ./
