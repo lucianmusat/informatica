@@ -3,9 +3,15 @@ import weaviate
 import traceback
 import streamlit as st
 from pypdf import PdfReader
+
+# Optional: better PDF text extraction (handles many manuals better than pypdf)
+try:
+    import fitz  # PyMuPDF
+except Exception:  # pragma: no cover
+    fitz = None
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
+from langchain_core.messages import HumanMessage, AIMessage
+# (removed ConversationalRetrievalChain; using single-call RAG)
 from langchain_weaviate.vectorstores import WeaviateVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from weaviate.exceptions import WeaviateConnectionError
@@ -16,7 +22,8 @@ from html_templates import css, bot_template, user_template
 from streamhandler import StreamHandler
 
 WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
-LLM_MODEL = "mistral"
+# Default to a small model that fits better in 4GB VRAM; allow overriding via env.
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b-instruct")
 EMBEDDER_MODEL = "nomic-embed-text"
 # In k8s, use the service DNS name; locally we need to port-forward and set OLLAMA_URL=http://localhost:11434
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama.default.svc.cluster.local:11434")
@@ -24,13 +31,40 @@ WEAVIATE_URL = os.getenv("WEAVIATE_URL", "weaviate.default.svc.cluster.local")
 
 
 def pdf_extract_text(pdf_files: list) -> dict:
-    pdf_texts = {}
+    """Extract text from uploaded PDFs.
+
+    We try PyMuPDF first (usually better for manuals / weird encodings).
+    Fallback to pypdf.
+    """
+    pdf_texts: dict[str, str] = {}
+
     for pdf in pdf_files:
-        pdf_reader = PdfReader(pdf)
         text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+
+        # Streamlit upload objects behave like file-like objects.
+        if fitz is not None:
+            try:
+                pdf.seek(0)
+                data = pdf.read()
+                doc = fitz.open(stream=data, filetype="pdf")
+                for page in doc:
+                    text += page.get_text("text") or ""
+                doc.close()
+            except Exception:
+                # Fall back to pypdf
+                text = ""
+
+        if not text:
+            try:
+                pdf.seek(0)
+                pdf_reader = PdfReader(pdf)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() or ""
+            except Exception:
+                text = ""
+
         pdf_texts[pdf.name] = text  # Associate text with file name
+
     return pdf_texts
 
 
@@ -45,24 +79,61 @@ def get_text_chunks(text) -> list[str]:
     return chunks
 
 
-def get_conversation_chain(vectorstore):
-    llm = ChatOllama(
+def get_llm():
+    """Chat LLM used for answering.
+
+    We intentionally do a single LLM call per user message (no condense/rephrase step),
+    because the extra chain step was showing up as an "intermediary question".
+    """
+    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+
+    # Match what Ollama is willing to use; qwen2.5:3b-instruct typically supports 4096.
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+    return ChatOllama(
         model=LLM_MODEL,
         temperature=0,
         base_url=OLLAMA_URL,
-        streaming=True
+        streaming=True,
+        keep_alive=keep_alive,
+        num_ctx=num_ctx,
     )
-    memory = ConversationBufferMemory(
-        memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory
-    )
-    return conversation_chain
 
 
-def handle_userinput(user_input: str) -> None:
+def build_rag_prompt(question: str, docs, chat_messages) -> str:
+    # Keep history short to reduce prompt size / latency
+    history_lines = []
+    for m in chat_messages[-6:]:
+        t = getattr(m, "type", "")
+        if t == "human":
+            history_lines.append(f"User: {m.content}")
+        elif t == "ai":
+            history_lines.append(f"Assistant: {m.content}")
+
+    context_blocks = []
+    for i, d in enumerate(docs):
+        src = ""
+        try:
+            src = d.metadata.get("fileName", "")
+        except Exception:
+            src = ""
+        header = f"[Source {i+1}{': ' + src if src else ''}]"
+        context_blocks.append(header + "\n" + (d.page_content or ""))
+
+    history_text = "\n".join(history_lines).strip()
+    context_text = "\n\n".join(context_blocks).strip() or "(no relevant context retrieved)"
+
+    return (
+        "You are a helpful assistant answering questions about the user's documents.\n"
+        "Use ONLY the provided context when possible; if the context is insufficient, say so and ask a clarifying question.\n\n"
+        + ("CHAT HISTORY:\n" + history_text + "\n\n" if history_text else "")
+        + "CONTEXT:\n" + context_text + "\n\n"
+        + "QUESTION:\n" + question + "\n\n"
+        + "ANSWER:\n"
+    )
+
+
+def handle_userinput(user_input: str, chat_container) -> None:
     # Safeguard against Streamlit reruns causing duplicate sends.
     # If the same question is already in-flight or was just processed, do nothing.
     if st.session_state.get("_inflight_question") == user_input:
@@ -70,33 +141,44 @@ def handle_userinput(user_input: str) -> None:
     if st.session_state.get("_last_processed_question") == user_input:
         return
 
-    if not st.session_state.conversation:
-        st.write(bot_template.replace(
-            "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
+    if not st.session_state.vectorstore or not st.session_state.llm:
+        with chat_container:
+            st.write(bot_template.replace(
+                "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
         st.session_state["_last_processed_question"] = user_input
         return
 
     st.session_state["_inflight_question"] = user_input
 
-    st.write(user_template.replace("{{MSG}}", user_input), unsafe_allow_html=True)
+    # Persist the user's message first
+    st.session_state.chat_messages.append(HumanMessage(content=user_input))
 
-    # Create a placeholder for the AI response (we'll show a typing animation until tokens arrive)
-    response_placeholder = st.empty()
-    response_placeholder.markdown(
-        bot_template.replace(
-            "{{MSG}}",
-            '<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>'
-        ),
-        unsafe_allow_html=True
-    )
+    with chat_container:
+        st.write(user_template.replace("{{MSG}}", user_input), unsafe_allow_html=True)
+
+        # Create a placeholder for the AI response (we'll show a typing animation until tokens arrive)
+        response_placeholder = st.empty()
+        response_placeholder.markdown(
+            bot_template.replace(
+                "{{MSG}}",
+                '<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>'
+            ),
+            unsafe_allow_html=True
+        )
 
     try:
         stream_handler = StreamHandler(response_placeholder)
 
-        # Use the callbacks parameter in the __call__ method
-        response = st.session_state.conversation.__call__(
-            {'question': user_input},
-            callbacks=[stream_handler]
+        # Pass chat history explicitly
+        history = st.session_state.get("chat_messages", [])
+
+        docs = st.session_state.vectorstore.similarity_search(user_input, k=4)
+        prompt = build_rag_prompt(user_input, docs, history)
+
+        llm = st.session_state.llm
+        response = llm.invoke(
+            prompt,
+            config={"callbacks": [stream_handler]},
         )
     except Exception as e:
         st.error(f"An unexpected error occurred: {e}", icon="⚠️")
@@ -104,7 +186,13 @@ def handle_userinput(user_input: str) -> None:
         st.session_state["_inflight_question"] = None
         return
 
-    st.session_state.chat_history = response['chat_history']
+    answer_text = (stream_handler.text or "").strip()
+    if not answer_text:
+        # Fallback if for some reason streaming didn't populate
+        answer_text = getattr(response, "content", "") if response is not None else ""
+
+    st.session_state.chat_messages.append(AIMessage(content=answer_text))
+
     st.session_state["_last_processed_question"] = user_input
     st.session_state["_inflight_question"] = None
 
@@ -184,12 +272,21 @@ def main():
                        page_icon=":books:", initial_sidebar_state="collapsed")
     st.write(css, unsafe_allow_html=True)
 
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
+    # (conversation chain removed; we use single-call RAG)
+    if "llm" not in st.session_state:
+        st.session_state.llm = None
+    if "vectorstore" not in st.session_state:
+        st.session_state.vectorstore = None
     if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = []
+
+    # Chat state (we store it ourselves; avoids LangChain memory deprecations)
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    # Back-compat (old key no longer used)
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = None
 
     # Rerun/submit safeguards
     if "_inflight_question" not in st.session_state:
@@ -211,12 +308,20 @@ def main():
                                                Property(name="fileName", data_type=DataType.TEXT)
                                            ])
 
-    embeddings = OllamaEmbeddings(base_url=OLLAMA_URL, model=EMBEDDER_MODEL)
+    embeddings = OllamaEmbeddings(
+        base_url=OLLAMA_URL,
+        model=EMBEDDER_MODEL,
+    )
     vectorstore = WeaviateVectorStore(client=weaviate_client, index_name=WEAVIATE_CLASS_NAME, text_key="text",
                                       embedding=embeddings)
 
-    if st.session_state.conversation is None:
-        st.session_state.conversation = get_conversation_chain(vectorstore)
+    if "vectorstore" not in st.session_state:
+        st.session_state.vectorstore = vectorstore
+    else:
+        st.session_state.vectorstore = vectorstore
+
+    if "llm" not in st.session_state or st.session_state.llm is None:
+        st.session_state.llm = get_llm()
 
     left_co, cent_co, last_co = st.columns(3)
     with cent_co:
@@ -225,26 +330,26 @@ def main():
     st.logo("static/logo.png")
     st.header("Informatica :: Converse with documents :books:")
 
-    # Chat input: use a form so we only submit on Enter / Send (not on blur / rerun)
-    with st.form(key="chat_form", clear_on_submit=True):
-        question = st.text_input("Message:", key="user_input")
-        submitted = st.form_submit_button("Send")
+    chat_container = st.container()
 
-    if submitted and question and question.strip():
-        handle_userinput(question.strip())
-
-    if st.session_state.chat_history:
-        # Exclude the last message pair: it's already displayed above (user bubble + streaming bot bubble).
-        # Render the rest in chronological order and use message.type to avoid swapped avatars.
-        for message in st.session_state.chat_history[:-2]:
+    with chat_container:
+        # Render chat history (chronological) from Streamlit state.
+        for message in st.session_state.get("chat_messages", []):
             msg_type = getattr(message, "type", "")
             if msg_type == "human":
                 st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
             elif msg_type == "ai":
                 st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
             else:
-                # Fallback: if we ever see an unexpected message type, render as bot.
                 st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+
+    # Chat input: use a form so we only submit on Enter / Send (not on blur / rerun)
+    with st.form(key="chat_form", clear_on_submit=True):
+        question = st.text_input("Message:", key="user_input")
+        submitted = st.form_submit_button("Send")
+
+    if submitted and question and question.strip():
+        handle_userinput(question.strip(), chat_container)
 
     with st.sidebar:
         st.subheader("PDFs")
@@ -252,7 +357,8 @@ def main():
         if st.button("Process"):
             with st.spinner("Processing"):
                 store_pdf_content(pdf_extract_text(pdf_files), vectorstore)
-                st.session_state.conversation = get_conversation_chain(vectorstore)
+                st.session_state.vectorstore = vectorstore
+                st.session_state.llm = get_llm()
 
         st.write("Available documents")
         for file_name in get_all_files(weaviate_client, WEAVIATE_CLASS_NAME):

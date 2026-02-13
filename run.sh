@@ -8,5 +8,6 @@ export WEAVIATE_URL=localhost
 export WEAVIATE_HTTP_PORT=8080
 export WEAVIATE_GRPC_PORT=50051
 export OLLAMA_URL=http://localhost:11434
+export OLLAMA_KEEP_ALIVE=30m
 
 streamlit run app.py

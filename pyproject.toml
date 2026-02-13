@@ -13,6 +13,7 @@ langchain-weaviate = "^0.0.3"
 langchain-ollama = "^0.2.0"
 weaviate-client = "^4.8.1"
 pypdf = "^5.0.1"
+pymupdf = "^1.24.0"
 
 [tool.poetry.dev-dependencies]
 
