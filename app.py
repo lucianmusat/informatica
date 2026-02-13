@@ -18,11 +18,9 @@ from streamhandler import StreamHandler
 WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
 LLM_MODEL = "mistral"
 EMBEDDER_MODEL = "nomic-embed-text"
-OLLAMA_URL = "http://ollama.default.svc.cluster.local:11434"
-# OLLAMA_URL = "http://localhost:11434"
-# In k8s, use the service DNS name (not a pod name)
-WEAVIATE_URL = "weaviate.default.svc.cluster.local"
-# WEAVIATE_URL = "localhost"
+# In k8s, use the service DNS name; locally we need to port-forward and set OLLAMA_URL=http://localhost:11434
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama.default.svc.cluster.local:11434")
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "weaviate.default.svc.cluster.local")
 
 
 def pdf_extract_text(pdf_files: list) -> dict:
@@ -65,31 +63,50 @@ def get_conversation_chain(vectorstore):
 
 
 def handle_userinput(user_input: str) -> None:
+    # Safeguard against Streamlit reruns causing duplicate sends.
+    # If the same question is already in-flight or was just processed, do nothing.
+    if st.session_state.get("_inflight_question") == user_input:
+        return
+    if st.session_state.get("_last_processed_question") == user_input:
+        return
+
     if not st.session_state.conversation:
         st.write(bot_template.replace(
             "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
+        st.session_state["_last_processed_question"] = user_input
         return
+
+    st.session_state["_inflight_question"] = user_input
 
     st.write(user_template.replace("{{MSG}}", user_input), unsafe_allow_html=True)
 
-    # Create a placeholder for the AI response
+    # Create a placeholder for the AI response (we'll show a typing animation until tokens arrive)
     response_placeholder = st.empty()
+    response_placeholder.markdown(
+        bot_template.replace(
+            "{{MSG}}",
+            '<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>'
+        ),
+        unsafe_allow_html=True
+    )
 
-    with st.spinner('Processing your question...'):
-        try:
-            stream_handler = StreamHandler(response_placeholder)
+    try:
+        stream_handler = StreamHandler(response_placeholder)
 
-            # Use the callbacks parameter in the __call__ method
-            response = st.session_state.conversation.__call__(
-                {'question': user_input},
-                callbacks=[stream_handler]
-            )
-        except Exception as e:
-            st.error(f"An unexpected error occurred: {e}", icon="⚠️")
-            st.error(traceback.format_exc())
-            return
+        # Use the callbacks parameter in the __call__ method
+        response = st.session_state.conversation.__call__(
+            {'question': user_input},
+            callbacks=[stream_handler]
+        )
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {e}", icon="⚠️")
+        st.error(traceback.format_exc())
+        st.session_state["_inflight_question"] = None
+        return
 
-        st.session_state.chat_history = response['chat_history']
+    st.session_state.chat_history = response['chat_history']
+    st.session_state["_last_processed_question"] = user_input
+    st.session_state["_inflight_question"] = None
 
 
 def remove_file_and_embeddings(file_name: str, client, class_name: str):
@@ -174,6 +191,12 @@ def main():
     if "uploaded_files" not in st.session_state:
         st.session_state.uploaded_files = []
 
+    # Rerun/submit safeguards
+    if "_inflight_question" not in st.session_state:
+        st.session_state._inflight_question = None
+    if "_last_processed_question" not in st.session_state:
+        st.session_state._last_processed_question = None
+
     weaviate_client = get_weaviate_client()
     if not weaviate_client:
         return
@@ -202,16 +225,25 @@ def main():
     st.logo("static/logo.png")
     st.header("Informatica :: Converse with documents :books:")
 
-    question = st.text_input("Message:", key="user_input")
-    if question:
-        handle_userinput(question)
+    # Chat input: use a form so we only submit on Enter / Send (not on blur / rerun)
+    with st.form(key="chat_form", clear_on_submit=True):
+        question = st.text_input("Message:", key="user_input")
+        submitted = st.form_submit_button("Send")
+
+    if submitted and question and question.strip():
+        handle_userinput(question.strip())
 
     if st.session_state.chat_history:
-        # Exclude the last message pair, because it has been already displayed by the callback
-        for i, message in enumerate(reversed(st.session_state.chat_history[:-2])):
-            if i % 2 == 0:
+        # Exclude the last message pair: it's already displayed above (user bubble + streaming bot bubble).
+        # Render the rest in chronological order and use message.type to avoid swapped avatars.
+        for message in st.session_state.chat_history[:-2]:
+            msg_type = getattr(message, "type", "")
+            if msg_type == "human":
                 st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            elif msg_type == "ai":
+                st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
             else:
+                # Fallback: if we ever see an unexpected message type, render as bot.
                 st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
 
     with st.sidebar:
