@@ -1,0 +1,87 @@
+# Local development stack: Ollama (GPU) + Weaviate + the Streamlit app.
+#
+#   docker compose up -d ollama weaviate   # start the backends
+#   docker compose run --rm model-init     # pull the LLM + embedding models (once)
+#   docker compose up app                  # run the UI on http://localhost:8501
+#
+# The app service bind-mounts the working tree, so Streamlit hot-reloads on save.
+#
+# GPU note: the ollama service needs the native Docker daemon, not Docker Desktop
+# (Desktop runs its own VM with no nvidia runtime). If `docker context ls` shows
+# desktop-linux as current, prefix these with `docker --context default` or export
+# DOCKER_CONTEXT=default. Drop the `runtime:` line below to run Ollama on CPU.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: informatica-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: "30m"
+      # Quantised KV cache roughly halves context memory, which is what makes a
+      # 4B model fit alongside the embedder on a 4GB card. Needs flash attention.
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    runtime: nvidia
+
+  # One-shot: warms the model cache in the ollama volume, then exits.
+  model-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      'ollama pull ${LLM_MODEL:-qwen3:4b-instruct} &&
+       ollama pull ${EMBEDDER_MODEL:-nomic-embed-text}'
+    restart: "no"
+
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.38.16
+    container_name: informatica-weaviate
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      CLUSTER_HOSTNAME: "node1"
+
+  app:
+    build: .
+    container_name: informatica-app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    depends_on:
+      - ollama
+      - weaviate
+    environment:
+      OLLAMA_URL: "http://ollama:11434"
+      WEAVIATE_URL: "weaviate"
+      WEAVIATE_HTTP_PORT: "8080"
+      WEAVIATE_GRPC_PORT: "50051"
+      LLM_MODEL: "${LLM_MODEL:-qwen3:4b-instruct}"
+      OLLAMA_NUM_CTX: "4096"
+    command:
+      - streamlit
+      - run
+      - app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.fileWatcherType=poll
+
+volumes:
+  ollama-models:
+  weaviate-data:

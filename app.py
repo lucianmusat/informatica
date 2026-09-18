@@ -1,374 +1,334 @@
-import os
-import weaviate
 import traceback
+
 import streamlit as st
-from pypdf import PdfReader
-
-# Optional: better PDF text extraction (handles many manuals better than pypdf)
-try:
-    import fitz  # PyMuPDF
-except Exception:  # pragma: no cover
-    fitz = None
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_core.messages import HumanMessage, AIMessage
-# (removed ConversationalRetrievalChain; using single-call RAG)
-from langchain_weaviate.vectorstores import WeaviateVectorStore
+import weaviate
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_weaviate.vectorstores import WeaviateVectorStore
+from weaviate.classes.config import DataType, Property
 from weaviate.exceptions import WeaviateConnectionError
-from weaviate.classes.config import Property, DataType
-from weaviate.classes.query import Filter
 
-from html_templates import css, bot_template, user_template
-from streamhandler import StreamHandler
+import prompts
+import rag
+from config import (
+    EMBEDDER_MODEL,
+    LLM_MODEL,
+    MAX_HISTORY_MESSAGES,
+    OLLAMA_KEEP_ALIVE,
+    OLLAMA_NUM_CTX,
+    OLLAMA_TEMPERATURE,
+    OLLAMA_URL,
+    RETRIEVAL_K,
+    RETRIEVAL_MAX_DISTANCE,
+    WEAVIATE_CLASS_NAME,
+    WEAVIATE_GRPC_PORT,
+    WEAVIATE_GRPC_SECURE,
+    WEAVIATE_HTTP_PORT,
+    WEAVIATE_HTTP_SECURE,
+    WEAVIATE_URL,
+)
+from html_templates import TYPING_INDICATOR, css
+from pdf_utils import extract_documents
 
-WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
-# Default to a small model that fits better in 4GB VRAM; allow overriding via env.
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:3b-instruct")
-EMBEDDER_MODEL = "nomic-embed-text"
-# In k8s, use the service DNS name; locally we need to port-forward and set OLLAMA_URL=http://localhost:11434
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama.default.svc.cluster.local:11434")
-WEAVIATE_URL = os.getenv("WEAVIATE_URL", "weaviate.default.svc.cluster.local")
+LOGO = "static/logo.png"
+BOT_AVATAR = "static/bot.png"
+USER_AVATAR = "static/user.png"
 
 
-def pdf_extract_text(pdf_files: list) -> dict:
-    """Extract text from uploaded PDFs.
+def turn(role: str, index: int):
+    """A chat message wrapped in a keyed container.
 
-    We try PyMuPDF first (usually better for manuals / weird encodings).
-    Fallback to pypdf.
+    Streamlit renders *custom image* avatars as stChatMessageAvatarCustom for both
+    roles, so the avatar testid can't distinguish them in CSS. st.container(key=...)
+    emits an "st-key-<key>" class on the wrapper, which the stylesheet keys off to
+    tint the user's turn only.
     """
-    pdf_texts: dict[str, str] = {}
-
-    for pdf in pdf_files:
-        text = ""
-
-        # Streamlit upload objects behave like file-like objects.
-        if fitz is not None:
-            try:
-                pdf.seek(0)
-                data = pdf.read()
-                doc = fitz.open(stream=data, filetype="pdf")
-                for page in doc:
-                    text += page.get_text("text") or ""
-                doc.close()
-            except Exception:
-                # Fall back to pypdf
-                text = ""
-
-        if not text:
-            try:
-                pdf.seek(0)
-                pdf_reader = PdfReader(pdf)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() or ""
-            except Exception:
-                text = ""
-
-        pdf_texts[pdf.name] = text  # Associate text with file name
-
-    return pdf_texts
+    return st.container(key=f"{role}turn-{index}")
 
 
-def get_text_chunks(text) -> list[str]:
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
+# --------------------------------------------------------------------------
+# Resources
+#
+# st.cache_resource keeps one client per server process. The previous version
+# stashed the Weaviate client in session_state and closed it at the end of every
+# run, so each rerun reconnected a client it had just torn down.
+# --------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_weaviate_client():
+    host = WEAVIATE_URL.replace("http://", "").replace("https://", "").strip("/")
+    client = weaviate.connect_to_custom(
+        http_host=host,
+        http_port=WEAVIATE_HTTP_PORT,
+        http_secure=WEAVIATE_HTTP_SECURE,
+        grpc_host=host,
+        grpc_port=WEAVIATE_GRPC_PORT,
+        grpc_secure=WEAVIATE_GRPC_SECURE,
     )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    if not client.collections.exists(WEAVIATE_CLASS_NAME):
+        client.collections.create(
+            WEAVIATE_CLASS_NAME,
+            properties=[
+                # "text" is the property WeaviateVectorStore writes chunks into.
+                Property(name="text", data_type=DataType.TEXT),
+                Property(name="fileName", data_type=DataType.TEXT),
+            ],
+        )
+    return client
 
 
-def get_llm():
-    """Chat LLM used for answering.
+@st.cache_resource(show_spinner=False)
+def get_embeddings():
+    return OllamaEmbeddings(base_url=OLLAMA_URL, model=EMBEDDER_MODEL)
 
-    We intentionally do a single LLM call per user message (no condense/rephrase step),
-    because the extra chain step was showing up as an "intermediary question".
-    """
-    keep_alive = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 
-    # Match what Ollama is willing to use; qwen2.5:3b-instruct typically supports 4096.
-    num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+@st.cache_resource(show_spinner=False)
+def get_vectorstore():
+    return WeaviateVectorStore(
+        client=get_weaviate_client(),
+        index_name=WEAVIATE_CLASS_NAME,
+        text_key="text",
+        embedding=get_embeddings(),
+    )
 
+
+@st.cache_resource(show_spinner=False)
+def get_llm(model: str, num_ctx: int, temperature: float):
     return ChatOllama(
-        model=LLM_MODEL,
-        temperature=0,
+        model=model,
         base_url=OLLAMA_URL,
-        streaming=True,
-        keep_alive=keep_alive,
+        temperature=temperature,
         num_ctx=num_ctx,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+        streaming=True,
     )
 
 
-def build_rag_prompt(question: str, docs, chat_messages) -> str:
-    # Keep history short to reduce prompt size / latency
-    history_lines = []
-    for m in chat_messages[-6:]:
-        t = getattr(m, "type", "")
-        if t == "human":
-            history_lines.append(f"User: {m.content}")
-        elif t == "ai":
-            history_lines.append(f"Assistant: {m.content}")
+# --------------------------------------------------------------------------
+# Chat
+# --------------------------------------------------------------------------
 
-    context_blocks = []
-    for i, d in enumerate(docs):
-        src = ""
-        try:
-            src = d.metadata.get("fileName", "")
-        except Exception:
-            src = ""
-        header = f"[Source {i+1}{': ' + src if src else ''}]"
-        context_blocks.append(header + "\n" + (d.page_content or ""))
+def gather_context(question: str, mode: str) -> list[rag.Hit]:
+    """Retrieved excerpts for this turn, honouring the sidebar retrieval mode.
 
-    history_text = "\n".join(history_lines).strip()
-    context_text = "\n\n".join(context_blocks).strip() or "(no relevant context retrieved)"
-
-    return (
-        "You are a helpful assistant answering questions about the user's documents.\n"
-        "Use ONLY the provided context when possible; if the context is insufficient, say so and ask a clarifying question.\n\n"
-        + ("CHAT HISTORY:\n" + history_text + "\n\n" if history_text else "")
-        + "CONTEXT:\n" + context_text + "\n\n"
-        + "QUESTION:\n" + question + "\n\n"
-        + "ANSWER:\n"
-    )
-
-
-def handle_userinput(user_input: str, chat_container) -> None:
-    # Safeguard against Streamlit reruns causing duplicate sends.
-    # If the same question is already in-flight or was just processed, do nothing.
-    if st.session_state.get("_inflight_question") == user_input:
-        return
-    if st.session_state.get("_last_processed_question") == user_input:
-        return
-
-    if not st.session_state.vectorstore or not st.session_state.llm:
-        with chat_container:
-            st.write(bot_template.replace(
-                "{{MSG}}", "Please process some documents first!"), unsafe_allow_html=True)
-        st.session_state["_last_processed_question"] = user_input
-        return
-
-    st.session_state["_inflight_question"] = user_input
-
-    # Persist the user's message first
-    st.session_state.chat_messages.append(HumanMessage(content=user_input))
-
-    with chat_container:
-        st.write(user_template.replace("{{MSG}}", user_input), unsafe_allow_html=True)
-
-        # Create a placeholder for the AI response (we'll show a typing animation until tokens arrive)
-        response_placeholder = st.empty()
-        response_placeholder.markdown(
-            bot_template.replace(
-                "{{MSG}}",
-                '<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span></span>'
-            ),
-            unsafe_allow_html=True
-        )
-
-    try:
-        stream_handler = StreamHandler(response_placeholder)
-
-        # Pass chat history explicitly
-        history = st.session_state.get("chat_messages", [])
-
-        docs = st.session_state.vectorstore.similarity_search(user_input, k=4)
-        prompt = build_rag_prompt(user_input, docs, history)
-
-        llm = st.session_state.llm
-        response = llm.invoke(
-            prompt,
-            config={"callbacks": [stream_handler]},
-        )
-    except Exception as e:
-        st.error(f"An unexpected error occurred: {e}", icon="⚠️")
-        st.error(traceback.format_exc())
-        st.session_state["_inflight_question"] = None
-        return
-
-    answer_text = (stream_handler.text or "").strip()
-    if not answer_text:
-        # Fallback if for some reason streaming didn't populate
-        answer_text = getattr(response, "content", "") if response is not None else ""
-
-    st.session_state.chat_messages.append(AIMessage(content=answer_text))
-
-    st.session_state["_last_processed_question"] = user_input
-    st.session_state["_inflight_question"] = None
-
-
-def remove_file_and_embeddings(file_name: str, client, class_name: str):
-    with st.spinner(f"Removing {file_name}..."):
-        try:
-            collection = client.collections.get(class_name)
-            file_filter = Filter.by_property("fileName").equal(file_name)
-            result = collection.data.delete_many(where=file_filter)
-            if file_name in st.session_state.uploaded_files:
-                st.session_state.uploaded_files.remove(file_name)
-            st.success(
-                f"Successfully removed {file_name} and its related embeddings. {result.matches} object(s) deleted.")
-        except Exception as e:
-            st.error(f"Error removing {file_name}: {str(e)}")
-            st.error(traceback.format_exc())
-
-
-def store_pdf_content(pdf_texts, vectorstore):
-    for file_name, text in pdf_texts.items():
-        try:
-            text_chunks = get_text_chunks(text)
-            metadata = [{"fileName": file_name} for _ in text_chunks]  # Include file name as metadata
-            vectorstore.add_texts(text_chunks, metadatas=metadata)  # Add texts with metadata
-            if file_name not in st.session_state.uploaded_files:
-                st.session_state.uploaded_files.append(file_name)
-            st.success(f"Successfully processed and stored {file_name}")
-        except Exception as e:
-            st.error(f"Error processing {file_name}: {str(e)}")
-            st.error(traceback.format_exc())
-
-
-def get_all_files(client, class_name: str) -> list[str]:
-    try:
-        collection = client.collections.get(class_name)
-        file_names = set()
-        for item in collection.iterator():
-            if "fileName" in item.properties:
-                file_name = item.properties["fileName"]
-                if file_name is not None:
-                    file_names.add(file_name)
-        return list(file_names)
-    except Exception as e:
-        st.error(f"Error fetching files: {e}")
+    "Auto" keeps only chunks within RETRIEVAL_MAX_DISTANCE of the question, so a
+    message that has nothing to do with the library contributes no context at all.
+    """
+    if mode == "Never":
         return []
 
+    try:
+        hits = rag.retrieve(
+            get_weaviate_client(),
+            get_embeddings(),
+            WEAVIATE_CLASS_NAME,
+            question,
+            RETRIEVAL_K,
+        )
+    except Exception:
+        # A retrieval failure should degrade to plain chat, not break the reply.
+        return []
 
-def get_weaviate_client():
-    if 'weaviate_client' not in st.session_state:
-        try:
-            # Use service DNS (FQDN) by default; allow overriding via env.
-            weaviate_host = os.getenv('WEAVIATE_URL', WEAVIATE_URL)
-            weaviate_host = weaviate_host.replace('http://', '').replace('https://', '').strip('/')
-
-            http_port = int(os.getenv('WEAVIATE_HTTP_PORT', '8080'))
-            grpc_port = int(os.getenv('WEAVIATE_GRPC_PORT', '50051'))
-            http_secure = os.getenv('WEAVIATE_HTTP_SECURE', 'false').lower() == 'true'
-            grpc_secure = os.getenv('WEAVIATE_GRPC_SECURE', 'false').lower() == 'true'
-
-            st.session_state.weaviate_client = weaviate.connect_to_custom(
-                http_host=weaviate_host,
-                http_port=http_port,
-                http_secure=http_secure,
-                grpc_host=weaviate_host,
-                grpc_port=grpc_port,
-                grpc_secure=grpc_secure,
-            )
-        except WeaviateConnectionError:
-            st.error('Cannot connect to the database!', icon="🚨")
-            return None
-    return st.session_state.weaviate_client
+    if mode == "Always":
+        return hits
+    return [h for h in hits if h.distance <= RETRIEVAL_MAX_DISTANCE]
 
 
-def main():
-    st.set_page_config(page_title="Informatica | Converse with documents",
-                       page_icon=":books:", initial_sidebar_state="collapsed")
-    st.write(css, unsafe_allow_html=True)
-
-    # (conversation chain removed; we use single-call RAG)
-    if "llm" not in st.session_state:
-        st.session_state.llm = None
-    if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = None
-    if "uploaded_files" not in st.session_state:
-        st.session_state.uploaded_files = []
-
-    # Chat state (we store it ourselves; avoids LangChain memory deprecations)
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-
-    # Back-compat (old key no longer used)
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
-
-    # Rerun/submit safeguards
-    if "_inflight_question" not in st.session_state:
-        st.session_state._inflight_question = None
-    if "_last_processed_question" not in st.session_state:
-        st.session_state._last_processed_question = None
-
-    weaviate_client = get_weaviate_client()
-    if not weaviate_client:
+def render_sources(hits: list[rag.Hit]) -> None:
+    if not hits:
         return
-    weaviate_client.connect()
+    names = ", ".join(dict.fromkeys(h.file_name for h in hits))
+    with st.expander(f"Sources · {names}"):
+        for hit in hits:
+            st.caption(f"**{hit.file_name}** — {hit.similarity:.0%} match")
+            st.text(hit.text[:700] + ("…" if len(hit.text) > 700 else ""))
 
-    # Create or update schema
-    if not weaviate_client.collections.exists(WEAVIATE_CLASS_NAME):
-        weaviate_client.collections.create(WEAVIATE_CLASS_NAME,
-                                           properties=[
-                                               Property(name="title", data_type=DataType.TEXT),
-                                               Property(name="body", data_type=DataType.TEXT),
-                                               Property(name="fileName", data_type=DataType.TEXT)
-                                           ])
 
-    embeddings = OllamaEmbeddings(
-        base_url=OLLAMA_URL,
-        model=EMBEDDER_MODEL,
+def stream_reply(messages) -> str:
+    """Stream the model's answer into the page, returning the finished text."""
+    placeholder = st.empty()
+    placeholder.markdown(TYPING_INDICATOR, unsafe_allow_html=True)
+
+    parts: list[str] = []
+    for chunk in get_llm(LLM_MODEL, OLLAMA_NUM_CTX, OLLAMA_TEMPERATURE).stream(messages):
+        text = chunk.content
+        if not text:
+            continue
+        parts.append(text)
+        placeholder.markdown("".join(parts) + " ▌")
+
+    answer = "".join(parts).strip()
+    placeholder.markdown(answer or "_(empty response)_")
+    return answer
+
+
+def answer(question: str, mode: str) -> None:
+    index = len(st.session_state.messages)
+    st.session_state.messages.append(HumanMessage(content=question))
+
+    with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
+        st.markdown(question)
+
+    with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR):
+        try:
+            hits = gather_context(question, mode)
+            payload = [SystemMessage(content=prompts.with_context(hits))]
+            payload += st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+
+            reply = stream_reply(payload)
+            render_sources(hits)
+        except Exception as exc:
+            st.error(f"Something went wrong: {exc}", icon="⚠️")
+            st.caption(traceback.format_exc())
+            st.session_state.messages.pop()
+            return
+
+    st.session_state.messages.append(
+        AIMessage(
+            content=reply,
+            additional_kwargs={
+                "sources": [(h.file_name, h.text, h.distance) for h in hits]
+            },
+        )
     )
-    vectorstore = WeaviateVectorStore(client=weaviate_client, index_name=WEAVIATE_CLASS_NAME, text_key="text",
-                                      embedding=embeddings)
 
-    if "vectorstore" not in st.session_state:
-        st.session_state.vectorstore = vectorstore
-    else:
-        st.session_state.vectorstore = vectorstore
 
-    if "llm" not in st.session_state or st.session_state.llm is None:
-        st.session_state.llm = get_llm()
+def replay_history() -> None:
+    for index, message in enumerate(st.session_state.messages):
+        if isinstance(message, HumanMessage):
+            with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
+                st.markdown(message.content)
+        else:
+            with turn("assistant", index), st.chat_message("assistant", avatar=BOT_AVATAR):
+                st.markdown(message.content)
+                stored = message.additional_kwargs.get("sources") or []
+                render_sources([rag.Hit(text=t, file_name=f, distance=d) for f, t, d in stored])
 
-    left_co, cent_co, last_co = st.columns(3)
-    with cent_co:
-        st.image("static/logo.png")
 
-    st.logo("static/logo.png")
-    st.header("Informatica :: Converse with documents :books:")
+# --------------------------------------------------------------------------
+# Sidebar
+# --------------------------------------------------------------------------
 
-    chat_container = st.container()
-
-    with chat_container:
-        # Render chat history (chronological) from Streamlit state.
-        for message in st.session_state.get("chat_messages", []):
-            msg_type = getattr(message, "type", "")
-            if msg_type == "human":
-                st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-            elif msg_type == "ai":
-                st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-            else:
-                st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
-
-    # Chat input: use a form so we only submit on Enter / Send (not on blur / rerun)
-    with st.form(key="chat_form", clear_on_submit=True):
-        question = st.text_input("Message:", key="user_input")
-        submitted = st.form_submit_button("Send")
-
-    if submitted and question and question.strip():
-        handle_userinput(question.strip(), chat_container)
-
+def render_sidebar(client) -> str:
     with st.sidebar:
-        st.subheader("PDFs")
-        pdf_files = st.file_uploader("Upload", accept_multiple_files=True)
-        if st.button("Process"):
-            with st.spinner("Processing"):
-                store_pdf_content(pdf_extract_text(pdf_files), vectorstore)
-                st.session_state.vectorstore = vectorstore
-                st.session_state.llm = get_llm()
+        st.subheader("Documents")
 
-        st.write("Available documents")
-        for file_name in get_all_files(weaviate_client, WEAVIATE_CLASS_NAME):
-            col1, col2 = st.columns([4, 1])
-            col1.write(file_name)
-            if col2.button("X", key=f"remove_{file_name}"):
-                remove_file_and_embeddings(file_name, weaviate_client, WEAVIATE_CLASS_NAME)
+        uploads = st.file_uploader(
+            "Upload PDFs", type=["pdf"], accept_multiple_files=True
+        )
+        if st.button("Process", use_container_width=True, disabled=not uploads):
+            vectorstore = get_vectorstore()
+            for name, text in extract_documents(uploads).items():
+                if not text.strip():
+                    st.warning(f"No extractable text in {name} — is it a scan?")
+                    continue
+                with st.spinner(f"Indexing {name}…"):
+                    try:
+                        chunks = rag.store_document(vectorstore, name, text)
+                        st.success(f"{name} — {chunks} chunks")
+                    except Exception as exc:
+                        st.error(f"{name}: {exc}")
 
-    if st.session_state.get('weaviate_client'):
-        st.session_state.weaviate_client.close()
+        documents = []
+        try:
+            documents = rag.list_documents(client, WEAVIATE_CLASS_NAME)
+        except Exception as exc:
+            st.error(f"Could not list documents: {exc}")
 
-if __name__ == '__main__':
+        if documents:
+            st.caption("In your library")
+            for name in documents:
+                row, remove = st.columns([5, 1])
+                row.write(name)
+                if remove.button("✕", key=f"rm_{name}", help=f"Remove {name}"):
+                    with st.spinner(f"Removing {name}…"):
+                        deleted = rag.delete_document(client, WEAVIATE_CLASS_NAME, name)
+                    st.toast(f"Removed {name} ({deleted} chunks)")
+                    st.rerun()
+        else:
+            st.caption("No documents yet — the assistant still answers normally.")
+
+        st.divider()
+
+        mode = st.radio(
+            "Use documents",
+            options=["Auto", "Always", "Never"],
+            index=0,
+            horizontal=True,
+            help=(
+                "Auto consults your library only when a passage is a close match "
+                "for your message. Always forces retrieval every turn; Never turns "
+                "it off entirely."
+            ),
+            disabled=not documents,
+        )
+        if not documents:
+            mode = "Never"
+
+        st.divider()
+
+        if st.button("New chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+
+        st.caption(f"Model · `{LLM_MODEL}`")
+        # Vector search fails *silently* on a Weaviate server older than the
+        # client expects (near_vector returns nothing at all, no error), so make
+        # the server version visible rather than debuggable only from logs.
+        try:
+            st.caption(f"Weaviate · `{client.get_meta().get('version', '?')}`")
+        except Exception:
+            st.caption("Weaviate · `unreachable`")
+
+    return mode
+
+
+# --------------------------------------------------------------------------
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Informatica",
+        page_icon=LOGO,
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(css, unsafe_allow_html=True)
+    st.logo(LOGO)
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    try:
+        client = get_weaviate_client()
+    except WeaviateConnectionError:
+        st.error("Cannot reach the document database.", icon="🚨")
+        st.caption(
+            "The assistant needs Weaviate for document storage. "
+            f"Tried `{WEAVIATE_URL}:{WEAVIATE_HTTP_PORT}`."
+        )
+        return
+
+    mode = render_sidebar(client)
+
+    # st.chat_input pins itself to the bottom wherever it is called, so reading
+    # it first lets this run know a question is incoming and skip the greeting.
+    question = st.chat_input("Message Informatica…")
+
+    if not st.session_state.messages and not question:
+        # Keyed so the stylesheet can centre the whole block; see html_templates.
+        with st.container(key="welcome"):
+            st.image(LOGO, width=76)
+            st.markdown("#### What can I help you with?")
+            st.caption(
+                "Ask me anything. Upload PDFs in the sidebar and I'll draw on them "
+                "when they're relevant."
+            )
+
+    replay_history()
+
+    if question and question.strip():
+        answer(question.strip(), mode)
+
+
+if __name__ == "__main__":
     main()
