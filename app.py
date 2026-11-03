@@ -49,7 +49,7 @@ from config import (
     WEAVIATE_HTTP_SECURE,
     WEAVIATE_URL,
 )
-from html_templates import THINKING_INDICATOR, TYPING_INDICATOR, css
+from html_templates import DISMISS_KEYBOARD_ON_SEND, THINKING_INDICATOR, TYPING_INDICATOR, css
 from pdf_utils import extract_documents
 
 LOGO = "static/logo.png"
@@ -645,6 +645,7 @@ def chat_page() -> None:
     # st.chat_input pins itself to the bottom wherever it is called, so reading
     # it first lets this run know a question is incoming and skip the greeting.
     question = st.chat_input("Message Informatica…")
+    st.html(DISMISS_KEYBOARD_ON_SEND, unsafe_allow_javascript=True)
 
     if not st.session_state.messages and not question:
         # Keyed so the stylesheet can centre the whole block; see html_templates.
