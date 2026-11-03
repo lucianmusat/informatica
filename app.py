@@ -1,4 +1,8 @@
+import json
+import time
 import traceback
+import urllib.request
+from dataclasses import dataclass
 
 import streamlit as st
 import weaviate
@@ -13,11 +17,18 @@ import rag
 from config import (
     EMBEDDER_MODEL,
     LLM_MODEL,
+    LLM_MODEL_BIG,
     MAX_HISTORY_MESSAGES,
+    OLLAMA_BIG_COOLDOWN,
+    OLLAMA_BIG_NAME,
+    OLLAMA_BIG_PROBE_TTL,
     OLLAMA_KEEP_ALIVE,
     OLLAMA_NUM_CTX,
+    OLLAMA_NUM_CTX_BIG,
+    OLLAMA_SMALL_NAME,
     OLLAMA_TEMPERATURE,
     OLLAMA_URL,
+    OLLAMA_URL_BIG,
     RETRIEVAL_K,
     RETRIEVAL_MAX_DISTANCE,
     WEAVIATE_CLASS_NAME,
@@ -92,11 +103,57 @@ def get_vectorstore():
     )
 
 
+# --------------------------------------------------------------------------
+# Chat backend selection: big (optional, ephemeral) with fallback to small
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Backend:
+    name: str
+    url: str
+    model: str
+    num_ctx: int
+
+SMALL = Backend(OLLAMA_SMALL_NAME, OLLAMA_URL, LLM_MODEL, OLLAMA_NUM_CTX)
+BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG)
+
 @st.cache_resource(show_spinner=False)
-def get_llm(model: str, num_ctx: int, temperature: float):
+def _big_state() -> dict:
+    """Process-wide, shared across sessions: when the big backend last failed."""
+    return {"down_until": 0.0}
+
+@st.cache_data(ttl=OLLAMA_BIG_PROBE_TTL, show_spinner=False)
+def _probe_big() -> bool:
+    """True when the big Ollama answers quickly *and* has its model pulled.
+
+    Checking /api/tags rather than just reachability avoids routing to a freshly
+    started node that is still downloading the model.
+    """
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL_BIG}/api/tags", timeout=1) as resp:
+            tags = json.load(resp)
+    except Exception:
+        return False
+    names = {m.get("name") for m in tags.get("models", [])}
+    return LLM_MODEL_BIG in names or f"{LLM_MODEL_BIG}:latest" in names
+
+def big_available() -> bool:
+    if not OLLAMA_URL_BIG or time.time() < _big_state()["down_until"]:
+        return False
+    return _probe_big()
+
+def mark_big_down() -> None:
+    _big_state()["down_until"] = time.time() + OLLAMA_BIG_COOLDOWN
+    _probe_big.clear()
+
+def pick_backend() -> Backend:
+    return BIG if big_available() else SMALL
+
+@st.cache_resource(show_spinner=False)
+def get_llm(url: str, model: str, num_ctx: int, temperature: float):
     return ChatOllama(
         model=model,
-        base_url=OLLAMA_URL,
+        base_url=url,
         temperature=temperature,
         num_ctx=num_ctx,
         keep_alive=OLLAMA_KEEP_ALIVE,
@@ -144,22 +201,44 @@ def render_sources(hits: list[rag.Hit]) -> None:
             st.text(hit.text[:700] + ("…" if len(hit.text) > 700 else ""))
 
 
-def stream_reply(messages) -> str:
-    """Stream the model's answer into the page, returning the finished text."""
-    placeholder = st.empty()
-    placeholder.markdown(TYPING_INDICATOR, unsafe_allow_html=True)
+def backend_label(backend: Backend) -> str:
+    return f"{backend.model} · {backend.name}"
 
+def _stream_from(backend: Backend, messages, placeholder) -> str:
+    llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE)
     parts: list[str] = []
-    for chunk in get_llm(LLM_MODEL, OLLAMA_NUM_CTX, OLLAMA_TEMPERATURE).stream(messages):
+    for chunk in llm.stream(messages):
         text = chunk.content
         if not text:
             continue
         parts.append(text)
         placeholder.markdown("".join(parts) + " ▌")
+    return "".join(parts).strip()
 
-    answer = "".join(parts).strip()
+def stream_reply(messages) -> tuple[str, Backend]:
+    """Stream the model's answer into the page.
+
+    Tries the big backend when it is up. If it fails at any point (the desktop
+    was switched off or the GPU got claimed by a game mid-answer) the reply is
+    restarted from scratch on the small backend, and the big one is skipped for
+    OLLAMA_BIG_COOLDOWN seconds so later turns don't pay for the failure again.
+    """
+    placeholder = st.empty()
+    placeholder.markdown(TYPING_INDICATOR, unsafe_allow_html=True)
+
+    backend = pick_backend()
+    try:
+        answer = _stream_from(backend, messages, placeholder)
+    except Exception:
+        if backend is SMALL:
+            raise
+        mark_big_down()
+        backend = SMALL
+        placeholder.markdown(TYPING_INDICATOR, unsafe_allow_html=True)
+        answer = _stream_from(backend, messages, placeholder)
+
     placeholder.markdown(answer or "_(empty response)_")
-    return answer
+    return answer, backend
 
 
 def answer(question: str, mode: str) -> None:
@@ -175,7 +254,8 @@ def answer(question: str, mode: str) -> None:
             payload = [SystemMessage(content=prompts.with_context(hits))]
             payload += st.session_state.messages[-MAX_HISTORY_MESSAGES:]
 
-            reply = stream_reply(payload)
+            reply, backend = stream_reply(payload)
+            st.caption(backend_label(backend))
             render_sources(hits)
         except Exception as exc:
             st.error(f"Something went wrong: {exc}", icon="⚠️")
@@ -187,7 +267,8 @@ def answer(question: str, mode: str) -> None:
         AIMessage(
             content=reply,
             additional_kwargs={
-                "sources": [(h.file_name, h.text, h.distance) for h in hits]
+                "sources": [(h.file_name, h.text, h.distance) for h in hits],
+                "backend": backend_label(backend),
             },
         )
     )
@@ -201,6 +282,8 @@ def replay_history() -> None:
         else:
             with turn("assistant", index), st.chat_message("assistant", avatar=BOT_AVATAR):
                 st.markdown(message.content)
+                if label := message.additional_kwargs.get("backend"):
+                    st.caption(label)
                 stored = message.additional_kwargs.get("sources") or []
                 render_sources([rag.Hit(text=t, file_name=f, distance=d) for f, t, d in stored])
 
@@ -271,7 +354,8 @@ def render_sidebar(client) -> str:
             st.session_state.messages = []
             st.rerun()
 
-        st.caption(f"Model · `{LLM_MODEL}`")
+        current = pick_backend()
+        st.caption(f"Model · `{current.model}` on {current.name}")
         # Vector search fails *silently* on a Weaviate server older than the
         # client expects (near_vector returns nothing at all, no error), so make
         # the server version visible rather than debuggable only from logs.

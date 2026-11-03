@@ -59,6 +59,16 @@ Drop `LLM_MODEL` back to `qwen2.5:3b-instruct` (1.9 GB weights) if the card turn
 to be tighter than expected. Mistral 7B, used in an earlier version, does not fit and
 was slow.
 
+### Optional big backend
+
+Set `OLLAMA_URL_BIG` to a second Ollama (in the cluster: the RTX 4090 desktop,
+`ollama-briareos`) and chat uses `LLM_MODEL_BIG` (default `qwen3.8:27b`, 16k
+context) whenever that server answers within 1s and has the model pulled. If it is
+off, or fails mid-answer, the reply is restarted on `OLLAMA_URL` with `LLM_MODEL`,
+and the big backend is skipped for `OLLAMA_BIG_COOLDOWN` seconds. Each answer is
+captioned with the model and machine that produced it. Embeddings always use
+`OLLAMA_URL`, so stored vectors and the retrieval threshold stay valid.
+
 ## Running it locally
 
 `docker-compose.yml` brings up the whole stack — Ollama with GPU, Weaviate, and the
