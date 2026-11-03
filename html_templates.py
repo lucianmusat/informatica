@@ -169,6 +169,11 @@ css = f"""
     border-radius: 50%;
     animation: typing-bounce 1.2s infinite ease-in-out;
 }}
+.typing .label {{
+    margin-left: 4px;
+    opacity: 0.6;
+    font-size: 0.9em;
+}}
 .typing .dot:nth-child(2) {{ animation-delay: 0.15s; }}
 .typing .dot:nth-child(3) {{ animation-delay: 0.30s; }}
 
@@ -185,5 +190,13 @@ css = f"""
 TYPING_INDICATOR = (
     '<span class="typing">'
     '<span class="dot"></span><span class="dot"></span><span class="dot"></span>'
+    "</span>"
+)
+
+# Shown while the model reasons before answering (its reasoning is not displayed).
+THINKING_INDICATOR = (
+    '<span class="typing">'
+    '<span class="dot"></span><span class="dot"></span><span class="dot"></span>'
+    '<span class="label">Thinking…</span>'
     "</span>"
 )

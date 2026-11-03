@@ -6,6 +6,12 @@ score, which is normalised across each result set — the best hit scores near t
 of the range whether or not it is actually relevant. Useless as an absolute
 "is this worth showing the model?" signal. A plain near_vector query gives a real
 cosine distance instead, which is comparable across queries and can be thresholded.
+
+Documents are private to the user who uploaded them. Every chunk carries an
+``owner`` (the uploader's email) and every read, list and delete filters on it.
+``owner`` uses FIELD tokenization so the filter is an exact match: with the default
+WORD tokenization, filtering on "bob@gmail.com" would also match
+"x.bob@gmail.com", because Weaviate compares the word tokens.
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from weaviate.classes.aggregate import GroupByAggregate
+from weaviate.classes.config import DataType, Property, Tokenization
 from weaviate.classes.query import Filter, MetadataQuery
 
 from config import CHUNK_OVERLAP, CHUNK_SIZE
@@ -48,23 +56,80 @@ def split_text(text: str) -> list[str]:
     return [c for c in splitter.split_text(text) if c.strip()]
 
 
-def store_document(vectorstore, file_name: str, text: str) -> int:
-    """Embed and persist one document. Returns the number of chunks stored."""
+OWNER = "owner"
+
+def collection_properties() -> list[Property]:
+    """Schema for a new document collection."""
+    return [
+        Property(name="text", data_type=DataType.TEXT),
+        Property(name="fileName", data_type=DataType.TEXT),
+        Property(name=OWNER, data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    ]
+
+
+def ensure_owner_property(client, class_name: str) -> None:
+    """Add ``owner`` to a collection created before documents were per-user.
+
+    Refuses to run on an ``owner`` that already exists with another tokenization,
+    because that filter would not be an exact match (see module docstring).
+    """
+    collection = client.collections.get(class_name)
+    existing = {p.name: p for p in collection.config.get().properties}
+    if OWNER not in existing:
+        collection.config.add_property(
+            Property(name=OWNER, data_type=DataType.TEXT, tokenization=Tokenization.FIELD)
+        )
+    elif existing[OWNER].tokenization != Tokenization.FIELD:
+        raise RuntimeError(
+            f"{class_name}.{OWNER} has tokenization {existing[OWNER].tokenization}, "
+            "expected FIELD; per-user filtering would not be exact."
+        )
+
+
+def assign_unowned(client, class_name: str, owner: str) -> int:
+    """Give chunks stored before per-user documents to ``owner``. Returns count."""
+    collection = client.collections.get(class_name)
+    unowned = [
+        item.uuid
+        for item in collection.iterator(return_properties=[OWNER])
+        if not (item.properties or {}).get(OWNER)
+    ]
+    for uuid in unowned:
+        collection.data.update(uuid=uuid, properties={OWNER: owner})
+    return len(unowned)
+
+
+def _owned_by(owner: str):
+    return Filter.by_property(OWNER).equal(owner)
+
+
+def store_document(vectorstore, file_name: str, text: str, owner: str) -> int:
+    """Embed and persist one document for ``owner``. Returns chunks stored."""
     chunks = split_text(text)
     if not chunks:
         return 0
-    vectorstore.add_texts(chunks, metadatas=[{"fileName": file_name} for _ in chunks])
+    vectorstore.add_texts(
+        chunks, metadatas=[{"fileName": file_name, OWNER: owner} for _ in chunks]
+    )
     return len(chunks)
 
 
-def retrieve(client, embeddings, class_name: str, query: str, k: int) -> list[Hit]:
-    """Nearest chunks by cosine distance, closest first."""
+def retrieve(
+    client, embeddings, class_name: str, query: str, k: int, *, owner: str | None
+) -> list[Hit]:
+    """Nearest chunks by cosine distance, closest first.
+
+    ``owner`` is required on purpose: the app always passes the signed-in user.
+    ``None`` (no filter) is only for single-tenant collections such as the
+    calibration tool's.
+    """
     collection = client.collections.get(class_name)
     vector = embeddings.embed_query(query)
 
     result = collection.query.near_vector(
         near_vector=vector,
         limit=k,
+        filters=_owned_by(owner) if owner is not None else None,
         return_metadata=MetadataQuery(distance=True),
     )
 
@@ -86,21 +151,34 @@ def retrieve(client, embeddings, class_name: str, query: str, k: int) -> list[Hi
     return hits
 
 
-def list_documents(client, class_name: str) -> list[str]:
-    """Distinct file names currently in the store."""
+def list_documents(client, class_name: str, owner: str) -> list[str]:
+    """Distinct file names ``owner`` has stored."""
     collection = client.collections.get(class_name)
-    names: set[str] = set()
-    for item in collection.iterator(return_properties=["fileName"]):
-        name = (item.properties or {}).get("fileName")
-        if name:
-            names.add(name)
-    return sorted(names)
-
-
-def delete_document(client, class_name: str, file_name: str) -> int:
-    """Drop every chunk belonging to one file. Returns objects deleted."""
-    collection = client.collections.get(class_name)
-    result = collection.data.delete_many(
-        where=Filter.by_property("fileName").equal(file_name)
+    result = collection.aggregate.over_all(
+        group_by=GroupByAggregate(prop="fileName", limit=10_000),
+        filters=_owned_by(owner),
     )
+    return sorted({g.grouped_by.value for g in result.groups if g.grouped_by.value})
+
+
+def delete_document(client, class_name: str, file_name: str, owner: str) -> int:
+    """Drop every chunk of one of ``owner``'s files. Returns objects deleted.
+
+    fileName is WORD-tokenized, so filtering on "a.pdf" also matches "a b.pdf".
+    The filter only narrows the candidates; the exact name is checked here and the
+    delete goes by id.
+    """
+    collection = client.collections.get(class_name)
+    candidates = collection.query.fetch_objects(
+        filters=_owned_by(owner) & Filter.by_property("fileName").equal(file_name),
+        return_properties=["fileName"],
+        limit=10_000,
+    )
+    ids = [
+        o.uuid for o in candidates.objects
+        if (o.properties or {}).get("fileName") == file_name
+    ]
+    if not ids:
+        return 0
+    result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
     return result.matches

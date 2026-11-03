@@ -1,4 +1,6 @@
 import json
+import logging
+import threading
 import time
 import traceback
 import urllib.request
@@ -8,13 +10,22 @@ import streamlit as st
 import weaviate
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from cassandra.cluster import Cluster
+from cassandra.policies import DCAwareRoundRobinPolicy
 from langchain_weaviate.vectorstores import WeaviateVectorStore
-from weaviate.classes.config import DataType, Property
 from weaviate.exceptions import WeaviateConnectionError
 
+import backends
 import prompts
 import rag
+from access import Access, check_access
+from notify import alert_new_user
+from users import APPROVED, BLOCKED, PENDING, CassandraUserStore
 from config import (
+    ADMIN_EMAIL,
+    CASSANDRA_HOSTS,
+    CASSANDRA_KEYSPACE,
+    CASSANDRA_PORT,
     EMBEDDER_MODEL,
     LLM_MODEL,
     LLM_MODEL_BIG,
@@ -38,12 +49,14 @@ from config import (
     WEAVIATE_HTTP_SECURE,
     WEAVIATE_URL,
 )
-from html_templates import TYPING_INDICATOR, css
+from html_templates import THINKING_INDICATOR, TYPING_INDICATOR, css
 from pdf_utils import extract_documents
 
 LOGO = "static/logo.png"
 BOT_AVATAR = "static/bot.png"
 USER_AVATAR = "static/user.png"
+
+log = logging.getLogger("informatica")
 
 
 def turn(role: str, index: int):
@@ -77,15 +90,37 @@ def get_weaviate_client():
         grpc_secure=WEAVIATE_GRPC_SECURE,
     )
     if not client.collections.exists(WEAVIATE_CLASS_NAME):
-        client.collections.create(
-            WEAVIATE_CLASS_NAME,
-            properties=[
-                # "text" is the property WeaviateVectorStore writes chunks into.
-                Property(name="text", data_type=DataType.TEXT),
-                Property(name="fileName", data_type=DataType.TEXT),
-            ],
-        )
+        # "text" is the property WeaviateVectorStore writes chunks into.
+        client.collections.create(WEAVIATE_CLASS_NAME, properties=rag.collection_properties())
+    else:
+        # Collections from before documents were per-user: add the owner field
+        # and hand the existing documents to the admin.
+        rag.ensure_owner_property(client, WEAVIATE_CLASS_NAME)
+        moved = rag.assign_unowned(client, WEAVIATE_CLASS_NAME, ADMIN_EMAIL)
+        if moved:
+            log.warning("assigned %d unowned chunks to %s", moved, ADMIN_EMAIL)
     return client
+
+
+@st.cache_resource(show_spinner=False)
+def get_user_store() -> CassandraUserStore:
+    """Raises if Cassandra is unreachable; cache_resource does not cache failures,
+    so the next rerun simply tries again."""
+    cluster = Cluster(
+        CASSANDRA_HOSTS,
+        port=CASSANDRA_PORT,
+        connect_timeout=3,
+        load_balancing_policy=DCAwareRoundRobinPolicy(local_dc="dc1"),
+        protocol_version=5,
+    )
+    store = CassandraUserStore(cluster.connect(), CASSANDRA_KEYSPACE)
+    store.ensure_schema()
+    return store
+
+
+def current_owner() -> str:
+    """Email of the signed-in user; every document operation is scoped to it."""
+    return st.session_state["user_email"]
 
 
 @st.cache_resource(show_spinner=False)
@@ -113,50 +148,113 @@ class Backend:
     url: str
     model: str
     num_ctx: int
+    # True streams the model's reasoning separately (used only to show
+    # "Thinking..."); None leaves it to the model and must be used for models
+    # without thinking support, which reject reasoning=True.
+    reasoning: bool | None = None
+
 
 SMALL = Backend(OLLAMA_SMALL_NAME, OLLAMA_URL, LLM_MODEL, OLLAMA_NUM_CTX)
-BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG)
+BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG, reasoning=True)
+
+# A cold load of the big model from disk takes over a minute; give up after this.
+BIG_WARMUP_TIMEOUT = 300
+
 
 @st.cache_resource(show_spinner=False)
 def _big_state() -> dict:
-    """Process-wide, shared across sessions: when the big backend last failed."""
-    return {"down_until": 0.0}
+    """Process-wide, shared across sessions."""
+    return {"down_until": 0.0, "warming_until": 0.0}
+
+
+def _get_json(path: str) -> dict:
+    with urllib.request.urlopen(f"{OLLAMA_URL_BIG}{path}", timeout=1) as resp:
+        return json.load(resp)
+
 
 @st.cache_data(ttl=OLLAMA_BIG_PROBE_TTL, show_spinner=False)
-def _probe_big() -> bool:
-    """True when the big Ollama answers quickly *and* has its model pulled.
+def _probe_big() -> str:
+    """"ready" (model in VRAM), "cold" (pulled but not loaded) or "down".
 
-    Checking /api/tags rather than just reachability avoids routing to a freshly
-    started node that is still downloading the model.
+    Checking /api/tags avoids routing to a freshly started node that is still
+    downloading the model; checking /api/ps avoids making a user wait for a cold
+    load, which reads 17GB from disk.
     """
     try:
-        with urllib.request.urlopen(f"{OLLAMA_URL_BIG}/api/tags", timeout=1) as resp:
-            tags = json.load(resp)
+        if backends.model_loaded(_get_json("/api/ps"), LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG):
+            return "ready"
+        return "cold" if backends.model_pulled(_get_json("/api/tags"), LLM_MODEL_BIG) else "down"
     except Exception:
-        return False
-    names = {m.get("name") for m in tags.get("models", [])}
-    return LLM_MODEL_BIG in names or f"{LLM_MODEL_BIG}:latest" in names
+        return "down"
 
-def big_available() -> bool:
-    if not OLLAMA_URL_BIG or time.time() < _big_state()["down_until"]:
-        return False
-    return _probe_big()
+
+def _warm_big() -> None:
+    """Load the big model in the background, once at a time across sessions.
+
+    An empty /api/generate request loads the model without generating. It uses
+    the same num_ctx as chat requests so the loaded copy is the one chat uses.
+    """
+    state = _big_state()
+    if time.time() < state["warming_until"]:
+        return
+    state["warming_until"] = time.time() + BIG_WARMUP_TIMEOUT
+
+    def run() -> None:
+        body = json.dumps({
+            "model": LLM_MODEL_BIG,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {"num_ctx": OLLAMA_NUM_CTX_BIG},
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL_BIG}/api/generate", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=BIG_WARMUP_TIMEOUT) as resp:
+                resp.read()
+            log.info("warmed %s on %s in %.0fs", LLM_MODEL_BIG, OLLAMA_BIG_NAME, time.time() - started)
+        except Exception:
+            log.warning("warm-up of %s failed", LLM_MODEL_BIG, exc_info=True)
+        finally:
+            state["warming_until"] = 0.0
+            _probe_big.clear()
+
+    threading.Thread(target=run, daemon=True, name="warm-big").start()
+
+
+def big_status() -> str:
+    """"off", "down", "warming" or "ready". A cold model starts warming."""
+    if not OLLAMA_URL_BIG:
+        return "off"
+    if time.time() < _big_state()["down_until"]:
+        return "down"
+    status = _probe_big()
+    if status == "cold":
+        _warm_big()
+        return "warming"
+    return status
+
 
 def mark_big_down() -> None:
     _big_state()["down_until"] = time.time() + OLLAMA_BIG_COOLDOWN
     _probe_big.clear()
 
+
 def pick_backend() -> Backend:
-    return BIG if big_available() else SMALL
+    """Big only when its model is already loaded; never wait for a cold load."""
+    return BIG if big_status() == "ready" else SMALL
+
 
 @st.cache_resource(show_spinner=False)
-def get_llm(url: str, model: str, num_ctx: int, temperature: float):
+def get_llm(url: str, model: str, num_ctx: int, temperature: float, reasoning: bool | None):
     return ChatOllama(
         model=model,
         base_url=url,
         temperature=temperature,
         num_ctx=num_ctx,
         keep_alive=OLLAMA_KEEP_ALIVE,
+        reasoning=reasoning,
     )
 
 
@@ -180,6 +278,7 @@ def gather_context(question: str, mode: str) -> list[rag.Hit]:
             WEAVIATE_CLASS_NAME,
             question,
             RETRIEVAL_K,
+            owner=current_owner(),
         )
     except Exception:
         # A retrieval failure should degrade to plain chat, not break the reply.
@@ -204,11 +303,17 @@ def backend_label(backend: Backend) -> str:
     return f"{backend.model} · {backend.name}"
 
 def _stream_from(backend: Backend, messages, placeholder) -> str:
-    llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE)
+    llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE, backend.reasoning)
     parts: list[str] = []
+    thinking = False
     for chunk in llm.stream(messages):
         text = chunk.content
         if not text:
+            # Reasoning is never shown, only signalled, so a long think doesn't
+            # look like a hang.
+            if not parts and not thinking and chunk.additional_kwargs.get("reasoning_content"):
+                placeholder.markdown(THINKING_INDICATOR, unsafe_allow_html=True)
+                thinking = True
             continue
         parts.append(text)
         placeholder.markdown("".join(parts) + " ▌")
@@ -306,14 +411,14 @@ def render_sidebar(client) -> str:
                     continue
                 with st.spinner(f"Indexing {name}…"):
                     try:
-                        chunks = rag.store_document(vectorstore, name, text)
+                        chunks = rag.store_document(vectorstore, name, text, owner=current_owner())
                         st.success(f"{name} — {chunks} chunks")
                     except Exception as exc:
                         st.error(f"{name}: {exc}")
 
         documents = []
         try:
-            documents = rag.list_documents(client, WEAVIATE_CLASS_NAME)
+            documents = rag.list_documents(client, WEAVIATE_CLASS_NAME, current_owner())
         except Exception as exc:
             st.error(f"Could not list documents: {exc}")
 
@@ -324,7 +429,7 @@ def render_sidebar(client) -> str:
                 row.write(name)
                 if remove.button("✕", key=f"rm_{name}", help=f"Remove {name}"):
                     with st.spinner(f"Removing {name}…"):
-                        deleted = rag.delete_document(client, WEAVIATE_CLASS_NAME, name)
+                        deleted = rag.delete_document(client, WEAVIATE_CLASS_NAME, name, current_owner())
                     st.toast(f"Removed {name} ({deleted} chunks)")
                     st.rerun()
         else:
@@ -354,7 +459,8 @@ def render_sidebar(client) -> str:
             st.rerun()
 
         current = pick_backend()
-        st.caption(f"Model · `{current.model}` on {current.name}")
+        note = f" ({OLLAMA_BIG_NAME} warming up)" if big_status() == "warming" else ""
+        st.caption(f"Model · `{current.model}` on {current.name}{note}")
         # Vector search fails *silently* on a Weaviate server older than the
         # client expects (near_vector returns nothing at all, no error), so make
         # the server version visible rather than debuggable only from logs.
@@ -367,17 +473,160 @@ def render_sidebar(client) -> str:
 
 
 # --------------------------------------------------------------------------
+# Sign-in and access
+# --------------------------------------------------------------------------
 
-def main() -> None:
-    st.set_page_config(
-        page_title="Informatica",
-        page_icon=LOGO,
-        layout="centered",
-        initial_sidebar_state="collapsed",
+def render_landing() -> None:
+    with st.container(key="welcome"):
+        st.image(LOGO, width=76)
+        st.markdown("#### Informatica")
+        st.caption("A private assistant. Sign in with Google to request access.")
+        if st.button("Sign in with Google", type="primary"):
+            try:
+                st.login()
+            except Exception as exc:
+                log.exception("sign-in is not configured")
+                st.error(f"Sign-in is not available right now ({type(exc).__name__}).")
+
+
+WAITING_TEXT = {
+    Access.PENDING: "Your access request has been sent. You'll be able to use "
+                    "Informatica once it's approved.",
+    # Deliberately the same as pending: no need to tell someone they are blocked.
+    Access.BLOCKED: "Your access request has been sent. You'll be able to use "
+                    "Informatica once it's approved.",
+    Access.UNVERIFIED: "Your Google account's email address isn't verified, so "
+                       "access can't be requested with it.",
+    Access.UNAVAILABLE: "Access can't be checked right now. Please try again in a "
+                        "few minutes.",
+}
+
+
+def render_waiting(access: Access) -> None:
+    with st.container(key="welcome"):
+        st.image(LOGO, width=76)
+        st.markdown(f"#### Hi {st.user.get('given_name') or st.user.get('name') or ''}".rstrip())
+        st.caption(WAITING_TEXT[access])
+        st.caption(f"Signed in as {st.user.get('email')}")
+        st.button("Log out", on_click=st.logout)
+
+
+def gate() -> Access:
+    """Render the sign-in or waiting screen unless this visitor may use the app.
+
+    Runs before anything touches Ollama or Weaviate, so an unapproved visitor
+    cannot spend GPU time or read documents.
+    """
+    if not st.user.is_logged_in:
+        render_landing()
+        return Access.UNVERIFIED
+
+    email = (st.user.get("email") or "").strip().lower()
+    if st.session_state.get("user_email") != email:
+        # A different account in the same browser session: start clean.
+        st.session_state.messages = []
+        st.session_state.pop("registered_for", None)
+    st.session_state.user_email = email
+
+    first_check = st.session_state.get("registered_for") != email
+    access = check_access(
+        email,
+        bool(st.user.get("email_verified", False)),
+        get_user_store,
+        ADMIN_EMAIL,
+        register=first_check,
+        name=st.user.get("name"),
+        picture=st.user.get("picture"),
+        on_new_user=alert_new_user,
     )
-    st.markdown(css, unsafe_allow_html=True)
-    st.logo(LOGO)
+    if first_check and access is not Access.UNAVAILABLE:
+        st.session_state.registered_for = email
 
+    if not access.allowed:
+        render_waiting(access)
+    return access
+
+
+def render_account() -> None:
+    with st.sidebar:
+        st.caption(f"Signed in as {st.session_state.user_email}")
+        st.button("Log out", on_click=st.logout, use_container_width=True)
+
+
+# --------------------------------------------------------------------------
+# Admin: access requests
+# --------------------------------------------------------------------------
+
+def _when(ts) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M") if ts else "never"
+
+
+def _decide(email: str, status: str) -> None:
+    get_user_store().set_status(email, status, ADMIN_EMAIL)
+    st.toast(f"{email}: {status}")
+
+
+ADMIN_SECTIONS = [
+    (PENDING, "Waiting for approval", [("Approve", APPROVED), ("Block", BLOCKED)]),
+    (APPROVED, "Approved", [("Revoke", BLOCKED)]),
+    (BLOCKED, "Blocked", [("Approve", APPROVED)]),
+]
+
+
+def admin_page() -> None:
+    # Navigation only offers this page to the admin; check again anyway.
+    if st.session_state.get("user_email") != ADMIN_EMAIL:
+        st.error("Not allowed.")
+        return
+
+    st.markdown("#### Access requests")
+    try:
+        users = [u for u in get_user_store().list_all() if u.email != ADMIN_EMAIL]
+    except Exception as exc:
+        st.error(f"Cannot reach the user database: {exc}")
+        return
+
+    for status, heading, actions in ADMIN_SECTIONS:
+        group = sorted(
+            (u for u in users if u.status == status),
+            key=lambda u: u.requested_at or u.last_login_at,
+            reverse=True,
+        )
+        st.markdown(f"**{heading}** ({len(group)})")
+        if not group:
+            st.caption("Nobody here.")
+            continue
+        for user in group:
+            with st.container(border=True):
+                info, buttons = st.columns([3, 1])
+                info.markdown(f"**{user.name or user.email}**  \n{user.email}")
+                detail = f"Requested {_when(user.requested_at)} · last login {_when(user.last_login_at)}"
+                if user.decided_at:
+                    detail += f" · {status} {_when(user.decided_at)}"
+                info.caption(detail)
+                for label, new_status in actions:
+                    buttons.button(
+                        label,
+                        key=f"{new_status}-{user.email}",
+                        on_click=_decide,
+                        args=(user.email, new_status),
+                        use_container_width=True,
+                        type="primary" if new_status == APPROVED else "secondary",
+                    )
+
+
+def pending_count() -> int:
+    try:
+        return sum(u.status == PENDING for u in get_user_store().list_all())
+    except Exception:
+        return 0
+
+
+# --------------------------------------------------------------------------
+# Chat page and entry point
+# --------------------------------------------------------------------------
+
+def chat_page() -> None:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -411,6 +660,34 @@ def main() -> None:
 
     if question and question.strip():
         answer(question.strip(), mode)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Informatica",
+        page_icon=LOGO,
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(css, unsafe_allow_html=True)
+    st.logo(LOGO)
+
+    access = gate()
+    if not access.allowed:
+        return
+
+    pages = [st.Page(chat_page, title="Chat", icon=":material/chat:", default=True)]
+    if access is Access.ADMIN:
+        waiting = pending_count()
+        pages.append(st.Page(
+            admin_page,
+            title=f"Access requests ({waiting})" if waiting else "Access requests",
+            icon=":material/group:",
+            url_path="access-requests",
+        ))
+    page = st.navigation(pages)
+    render_account()
+    page.run()
 
 
 if __name__ == "__main__":
