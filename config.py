@@ -63,7 +63,9 @@ APP_URL = os.getenv("APP_URL", "https://informatica.lucianmusat.nl").rstrip("/")
 
 CASSANDRA_HOSTS = [h.strip() for h in os.getenv(
     "CASSANDRA_HOSTS", "cassandra.default.svc.cluster.local").split(",") if h.strip()]
-CASSANDRA_PORT = int(os.getenv("CASSANDRA_PORT", "9042"))
+# Not CASSANDRA_PORT: Kubernetes injects that as "tcp://<ip>:9042" for the
+# `cassandra` Service.
+CASSANDRA_PORT = int(os.getenv("CASSANDRA_CQL_PORT", "9042"))
 CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "informatica")
 
 # Access-request alerts. Disabled when SMTP_PASSWORD is empty.
