@@ -200,3 +200,27 @@ THINKING_INDICATOR = (
     '<span class="label">Thinking…</span>'
     "</span>"
 )
+
+DISMISS_KEYBOARD_ON_SEND = """
+<script>
+(() => {
+  if (window.__informaticaKeyboardFix) return;
+  window.__informaticaKeyboardFix = true;
+  if (!window.matchMedia("(hover: none) and (pointer: coarse)").matches) return;
+
+  const dismiss = () => setTimeout(() => {
+    const active = document.activeElement;
+    if (active && active.closest('[data-testid="stChatInput"]')) active.blur();
+    window.scrollTo(0, 0);
+  }, 0);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing &&
+        e.target.closest && e.target.closest('[data-testid="stChatInput"]')) dismiss();
+  }, true);
+  document.addEventListener("click", (e) => {
+    if (e.target.closest && e.target.closest('[data-testid="stChatInputSubmitButton"]')) dismiss();
+  }, true);
+})();
+</script>
+"""
