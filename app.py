@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 import traceback
 import urllib.request
@@ -14,6 +15,7 @@ from cassandra.policies import DCAwareRoundRobinPolicy
 from langchain_weaviate.vectorstores import WeaviateVectorStore
 from weaviate.exceptions import WeaviateConnectionError
 
+import backends
 import prompts
 import rag
 from access import Access, check_access
@@ -47,7 +49,7 @@ from config import (
     WEAVIATE_HTTP_SECURE,
     WEAVIATE_URL,
 )
-from html_templates import TYPING_INDICATOR, css
+from html_templates import THINKING_INDICATOR, TYPING_INDICATOR, css
 from pdf_utils import extract_documents
 
 LOGO = "static/logo.png"
@@ -146,50 +148,113 @@ class Backend:
     url: str
     model: str
     num_ctx: int
+    # True streams the model's reasoning separately (used only to show
+    # "Thinking..."); None leaves it to the model and must be used for models
+    # without thinking support, which reject reasoning=True.
+    reasoning: bool | None = None
+
 
 SMALL = Backend(OLLAMA_SMALL_NAME, OLLAMA_URL, LLM_MODEL, OLLAMA_NUM_CTX)
-BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG)
+BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG, reasoning=True)
+
+# A cold load of the big model from disk takes over a minute; give up after this.
+BIG_WARMUP_TIMEOUT = 300
+
 
 @st.cache_resource(show_spinner=False)
 def _big_state() -> dict:
-    """Process-wide, shared across sessions: when the big backend last failed."""
-    return {"down_until": 0.0}
+    """Process-wide, shared across sessions."""
+    return {"down_until": 0.0, "warming_until": 0.0}
+
+
+def _get_json(path: str) -> dict:
+    with urllib.request.urlopen(f"{OLLAMA_URL_BIG}{path}", timeout=1) as resp:
+        return json.load(resp)
+
 
 @st.cache_data(ttl=OLLAMA_BIG_PROBE_TTL, show_spinner=False)
-def _probe_big() -> bool:
-    """True when the big Ollama answers quickly *and* has its model pulled.
+def _probe_big() -> str:
+    """"ready" (model in VRAM), "cold" (pulled but not loaded) or "down".
 
-    Checking /api/tags rather than just reachability avoids routing to a freshly
-    started node that is still downloading the model.
+    Checking /api/tags avoids routing to a freshly started node that is still
+    downloading the model; checking /api/ps avoids making a user wait for a cold
+    load, which reads 17GB from disk.
     """
     try:
-        with urllib.request.urlopen(f"{OLLAMA_URL_BIG}/api/tags", timeout=1) as resp:
-            tags = json.load(resp)
+        if backends.model_loaded(_get_json("/api/ps"), LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG):
+            return "ready"
+        return "cold" if backends.model_pulled(_get_json("/api/tags"), LLM_MODEL_BIG) else "down"
     except Exception:
-        return False
-    names = {m.get("name") for m in tags.get("models", [])}
-    return LLM_MODEL_BIG in names or f"{LLM_MODEL_BIG}:latest" in names
+        return "down"
 
-def big_available() -> bool:
-    if not OLLAMA_URL_BIG or time.time() < _big_state()["down_until"]:
-        return False
-    return _probe_big()
+
+def _warm_big() -> None:
+    """Load the big model in the background, once at a time across sessions.
+
+    An empty /api/generate request loads the model without generating. It uses
+    the same num_ctx as chat requests so the loaded copy is the one chat uses.
+    """
+    state = _big_state()
+    if time.time() < state["warming_until"]:
+        return
+    state["warming_until"] = time.time() + BIG_WARMUP_TIMEOUT
+
+    def run() -> None:
+        body = json.dumps({
+            "model": LLM_MODEL_BIG,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {"num_ctx": OLLAMA_NUM_CTX_BIG},
+        }).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL_BIG}/api/generate", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=BIG_WARMUP_TIMEOUT) as resp:
+                resp.read()
+            log.info("warmed %s on %s in %.0fs", LLM_MODEL_BIG, OLLAMA_BIG_NAME, time.time() - started)
+        except Exception:
+            log.warning("warm-up of %s failed", LLM_MODEL_BIG, exc_info=True)
+        finally:
+            state["warming_until"] = 0.0
+            _probe_big.clear()
+
+    threading.Thread(target=run, daemon=True, name="warm-big").start()
+
+
+def big_status() -> str:
+    """"off", "down", "warming" or "ready". A cold model starts warming."""
+    if not OLLAMA_URL_BIG:
+        return "off"
+    if time.time() < _big_state()["down_until"]:
+        return "down"
+    status = _probe_big()
+    if status == "cold":
+        _warm_big()
+        return "warming"
+    return status
+
 
 def mark_big_down() -> None:
     _big_state()["down_until"] = time.time() + OLLAMA_BIG_COOLDOWN
     _probe_big.clear()
 
+
 def pick_backend() -> Backend:
-    return BIG if big_available() else SMALL
+    """Big only when its model is already loaded; never wait for a cold load."""
+    return BIG if big_status() == "ready" else SMALL
+
 
 @st.cache_resource(show_spinner=False)
-def get_llm(url: str, model: str, num_ctx: int, temperature: float):
+def get_llm(url: str, model: str, num_ctx: int, temperature: float, reasoning: bool | None):
     return ChatOllama(
         model=model,
         base_url=url,
         temperature=temperature,
         num_ctx=num_ctx,
         keep_alive=OLLAMA_KEEP_ALIVE,
+        reasoning=reasoning,
     )
 
 
@@ -238,11 +303,17 @@ def backend_label(backend: Backend) -> str:
     return f"{backend.model} · {backend.name}"
 
 def _stream_from(backend: Backend, messages, placeholder) -> str:
-    llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE)
+    llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE, backend.reasoning)
     parts: list[str] = []
+    thinking = False
     for chunk in llm.stream(messages):
         text = chunk.content
         if not text:
+            # Reasoning is never shown, only signalled, so a long think doesn't
+            # look like a hang.
+            if not parts and not thinking and chunk.additional_kwargs.get("reasoning_content"):
+                placeholder.markdown(THINKING_INDICATOR, unsafe_allow_html=True)
+                thinking = True
             continue
         parts.append(text)
         placeholder.markdown("".join(parts) + " ▌")
@@ -388,7 +459,8 @@ def render_sidebar(client) -> str:
             st.rerun()
 
         current = pick_backend()
-        st.caption(f"Model · `{current.model}` on {current.name}")
+        note = f" ({OLLAMA_BIG_NAME} warming up)" if big_status() == "warming" else ""
+        st.caption(f"Model · `{current.model}` on {current.name}{note}")
         # Vector search fails *silently* on a Weaviate server older than the
         # client expects (near_vector returns nothing at all, no error), so make
         # the server version visible rather than debuggable only from logs.
