@@ -157,7 +157,6 @@ def get_llm(url: str, model: str, num_ctx: int, temperature: float):
         temperature=temperature,
         num_ctx=num_ctx,
         keep_alive=OLLAMA_KEEP_ALIVE,
-        streaming=True,
     )
 
 
