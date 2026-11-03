@@ -97,14 +97,14 @@ def main() -> int:
             embedding=embeddings,
         )
 
-        chunks = rag.store_document(store, "x900_service_manual.pdf", SAMPLE_DOC)
+        chunks = rag.store_document(store, "x900_service_manual.pdf", SAMPLE_DOC, owner="calibration")
         print(f"Indexed {chunks} chunks from the sample manual.\n")
 
         def probe(label: str, questions: list[str]) -> list[float]:
             print(f"--- {label} " + "-" * (58 - len(label)))
             best: list[float] = []
             for question in questions:
-                hits = rag.retrieve(client, embeddings, CALIBRATION_CLASS, question, 4)
+                hits = rag.retrieve(client, embeddings, CALIBRATION_CLASS, question, 4, owner=None)
                 top = hits[0].distance if hits else 2.0
                 best.append(top)
                 flag = "RETRIEVES" if top <= RETRIEVAL_MAX_DISTANCE else "skips    "

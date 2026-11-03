@@ -34,4 +34,6 @@ EXPOSE 8501
 WORKDIR /app
 
 # Run app.py when the container launches
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# write_secrets.py turns the GOOGLE_* / COOKIE_SECRET env vars (from a Kubernetes
+# Secret) into .streamlit/secrets.toml for Google sign-in, then Streamlit starts.
+CMD ["sh", "-c", "python write_secrets.py && exec streamlit run app.py --server.port=8501 --server.address=0.0.0.0"]

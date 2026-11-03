@@ -37,6 +37,33 @@ recursively at ~1000 chars with 200 overlap, embedded with `nomic-embed-text` an
 stored in Weaviate with the file name as metadata so a document can be deleted again
 as a unit.
 
+## Access
+
+Sign-in is with Google (Streamlit's built-in `st.login`). Anyone can sign in, but
+only approved accounts get past the gate; nothing touches Ollama or Weaviate
+before that check.
+
+- **Requests.** A first sign-in creates a `pending` row in Cassandra
+  (`informatica.users`) and emails `ALERT_EMAIL` (via Gmail SMTP, when
+  `SMTP_PASSWORD` is set).
+- **Admin.** `ADMIN_EMAIL` (default `amibadesign@gmail.com`) is always allowed,
+  even if Cassandra is down, and is the only account that sees the **Access
+  requests** page (approve, block, revoke). Status is re-read on every rerun, so a
+  revoke takes effect immediately.
+- **Fail closed.** If Cassandra is unreachable, everyone except the admin is
+  kept out.
+- **Private documents.** Each chunk carries an `owner` (FIELD-tokenized, so the
+  filter is an exact match), and listing, retrieval and deletion are scoped to the
+  signed-in user. Documents from before this change were assigned to the admin.
+
+The Google client credentials and cookie secret come from env vars
+(`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `COOKIE_SECRET`, `APP_URL`), which
+`write_secrets.py` turns into `.streamlit/secrets.toml` at container start. For
+local development copy `.streamlit/secrets.toml.example` instead.
+
+Tests: `pytest` runs the unit tests; `INFORMATICA_IT=1 CASSANDRA_HOSTS=... WEAVIATE_URL=... pytest`
+also runs the integration tests against real services.
+
 ## Model
 
 Default is **`qwen3:4b-instruct`** — the non-thinking Instruct-2507 build at Q4_K_M.

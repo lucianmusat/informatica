@@ -2,7 +2,7 @@
 
 import os
 
-WEAVIATE_CLASS_NAME = "DocumentConversationAlUsers"
+WEAVIATE_CLASS_NAME = os.getenv("WEAVIATE_CLASS_NAME", "DocumentConversationAlUsers")
 
 # Chat model. Defaults to Qwen3 4B Instruct (the non-thinking 2507 build, Q4_K_M,
 # ~2.5GB of weights) which fits a 4GB card alongside the embedder provided Ollama
@@ -49,3 +49,26 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
 # How many prior turns to replay to the model each request.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
+
+# --------------------------------------------------------------------------
+# Access control
+# --------------------------------------------------------------------------
+# Google sign-in is configured through .streamlit/secrets.toml ([auth]), which the
+# container entrypoint writes from GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET /
+# COOKIE_SECRET / APP_URL. See write_secrets.py.
+
+# Always allowed in, and the only one who sees the access-requests page.
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "amibadesign@gmail.com").strip().lower()
+APP_URL = os.getenv("APP_URL", "https://informatica.lucianmusat.nl").rstrip("/")
+
+CASSANDRA_HOSTS = [h.strip() for h in os.getenv(
+    "CASSANDRA_HOSTS", "cassandra.default.svc.cluster.local").split(",") if h.strip()]
+CASSANDRA_PORT = int(os.getenv("CASSANDRA_PORT", "9042"))
+CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "informatica")
+
+# Access-request alerts. Disabled when SMTP_PASSWORD is empty.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "amibadesign@gmail.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL", ADMIN_EMAIL)
