@@ -34,3 +34,17 @@ def test_write_secrets_noop_without_client_id(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "GOOGLE_CLIENT_ID"}
     subprocess.run([sys.executable, "write_secrets.py"], cwd=tmp_path, env=env, check=True)
     assert not (tmp_path / ".streamlit").exists()
+
+
+def test_llm_reasoning_parsing(monkeypatch):
+    import importlib
+
+    import config
+
+    try:
+        for raw, expected in [("true", True), (" False ", False), ("", None), ("maybe", None)]:
+            monkeypatch.setenv("LLM_REASONING", raw)
+            assert importlib.reload(config).LLM_REASONING is expected
+    finally:
+        monkeypatch.delenv("LLM_REASONING", raising=False)
+        importlib.reload(config)
