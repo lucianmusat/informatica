@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 import streamlit as st
 import weaviate
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from cassandra.cluster import Cluster
 from cassandra.policies import DCAwareRoundRobinPolicy
@@ -16,7 +15,7 @@ from langchain_weaviate.vectorstores import WeaviateVectorStore
 from weaviate.exceptions import WeaviateConnectionError
 
 import backends
-import prompts
+import conversation
 import rag
 from access import Access, check_access
 from notify import alert_new_user
@@ -59,6 +58,14 @@ BOT_AVATAR = "static/bot.png"
 USER_AVATAR = "static/user.png"
 
 log = logging.getLogger("informatica")
+# Streamlit leaves the root logger at WARNING; the per-answer token and timing
+# lines are INFO. Every rerun re-executes this module, hence the guard.
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 
 def turn(role: str, index: int):
@@ -306,11 +313,20 @@ def render_sources(hits: list[rag.Hit]) -> None:
 def backend_label(backend: Backend) -> str:
     return f"{backend.model} · {backend.name}"
 
-def _stream_from(backend: Backend, messages, placeholder) -> str:
+def _stream_from(backend: Backend, messages, placeholder) -> tuple[str, dict]:
+    """Stream one answer. Returns the raw text and the final chunk's metadata.
+
+    The text is kept exactly as generated (not stripped): it goes back to the
+    model in the next prompt, which llama.cpp can only serve from its cache if
+    it matches what was generated.
+    """
     llm = get_llm(backend.url, backend.model, backend.num_ctx, OLLAMA_TEMPERATURE, backend.reasoning)
     parts: list[str] = []
+    metadata: dict = {}
     thinking = False
     for chunk in llm.stream(messages):
+        if chunk.response_metadata.get("done"):
+            metadata = chunk.response_metadata
         text = chunk.content
         if not text:
             # Reasoning is never shown, only signalled, so a long think doesn't
@@ -321,9 +337,9 @@ def _stream_from(backend: Backend, messages, placeholder) -> str:
             continue
         parts.append(text)
         placeholder.markdown("".join(parts) + " ▌")
-    return "".join(parts).strip()
+    return "".join(parts), metadata
 
-def stream_reply(messages) -> tuple[str, Backend]:
+def stream_reply(messages) -> tuple[str, Backend, dict]:
     """Stream the model's answer into the page.
 
     Tries the big backend when it is up. If it fails at any point (the desktop
@@ -336,23 +352,23 @@ def stream_reply(messages) -> tuple[str, Backend]:
 
     backend = pick_backend()
     try:
-        answer = _stream_from(backend, messages, placeholder)
+        answer, metadata = _stream_from(backend, messages, placeholder)
     except Exception:
         if backend is SMALL:
             raise
         mark_big_down()
         backend = SMALL
         placeholder.markdown(TYPING_INDICATOR, unsafe_allow_html=True)
-        answer = _stream_from(backend, messages, placeholder)
+        answer, metadata = _stream_from(backend, messages, placeholder)
 
-    placeholder.markdown(answer or "_(empty response)_")
-    return answer, backend
+    placeholder.markdown(answer.strip() or "_(empty response)_")
+    return answer, backend, metadata
 
 
 def answer(question: str, mode: str) -> None:
     started = time.monotonic()  # the caption shows the whole wait, retrieval included
-    index = len(st.session_state.messages)
-    st.session_state.messages.append(HumanMessage(content=question))
+    messages = st.session_state.messages
+    index = len(messages)
 
     with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(question)
@@ -360,42 +376,50 @@ def answer(question: str, mode: str) -> None:
     with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR):
         try:
             hits = gather_context(question, mode)
-            payload = [SystemMessage(content=prompts.with_context(hits))]
-            payload += st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+            messages.append(conversation.user_message(
+                question, [(h.file_name, h.text, h.distance) for h in hits]))
+            payload = conversation.model_messages(messages[-MAX_HISTORY_MESSAGES:])
 
-            reply, backend = stream_reply(payload)
-            caption = f"{backend_label(backend)} · {format_duration(time.monotonic() - started)}"
+            reply, backend, metadata = stream_reply(payload)
+            elapsed = time.monotonic() - started
+            caption = f"{backend_label(backend)} · {format_duration(elapsed)}"
             st.caption(caption)
             render_sources(hits)
         except Exception as exc:
             st.error(f"Something went wrong: {exc}", icon="⚠️")
             st.caption(traceback.format_exc())
-            st.session_state.messages.pop()
+            if len(messages) > index:
+                messages.pop()
             return
 
-    st.session_state.messages.append(
-        AIMessage(
-            content=reply,
-            additional_kwargs={
-                "sources": [(h.file_name, h.text, h.distance) for h in hits],
-                "backend": caption,
-            },
-        )
+    usage = conversation.usage_from(metadata)
+    log.info(
+        "answer on %s: prompt %d tokens (%d chars) read in %.1fs, %d tokens written in %.1fs, "
+        "load %.1fs, wall %.1fs",
+        backend.name, usage["prompt_tokens"], conversation.payload_chars(payload),
+        usage["prompt_seconds"], usage["output_tokens"], usage["output_seconds"],
+        usage["load_seconds"], elapsed,
     )
+    messages.append({"role": "assistant", "content": reply, "caption": caption, "usage": usage})
+
+
+def _hits(excerpts) -> list[rag.Hit]:
+    return [rag.Hit(text=t, file_name=f, distance=d) for f, t, d in excerpts or []]
 
 
 def replay_history() -> None:
-    for index, message in enumerate(st.session_state.messages):
-        if isinstance(message, HumanMessage):
+    messages = st.session_state.messages
+    for index, message in enumerate(messages):
+        if message["role"] == "user":
             with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
-                st.markdown(message.content)
+                st.markdown(message["content"])
         else:
             with turn("assistant", index), st.chat_message("assistant", avatar=BOT_AVATAR):
-                st.markdown(message.content)
-                if label := message.additional_kwargs.get("backend"):
+                st.markdown(message["content"].strip())
+                if label := message.get("caption"):
                     st.caption(label)
-                stored = message.additional_kwargs.get("sources") or []
-                render_sources([rag.Hit(text=t, file_name=f, distance=d) for f, t, d in stored])
+                # The excerpts belong to the question this answers.
+                render_sources(_hits(messages[index - 1].get("excerpts")))
 
 
 # --------------------------------------------------------------------------
