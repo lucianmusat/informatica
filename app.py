@@ -29,6 +29,7 @@ from config import (
     EMBEDDER_MODEL,
     LLM_MODEL,
     LLM_MODEL_BIG,
+    LLM_REASONING,
     MAX_HISTORY_MESSAGES,
     OLLAMA_BIG_COOLDOWN,
     OLLAMA_BIG_NAME,
@@ -154,7 +155,7 @@ class Backend:
     reasoning: bool | None = None
 
 
-SMALL = Backend(OLLAMA_SMALL_NAME, OLLAMA_URL, LLM_MODEL, OLLAMA_NUM_CTX)
+SMALL = Backend(OLLAMA_SMALL_NAME, OLLAMA_URL, LLM_MODEL, OLLAMA_NUM_CTX, reasoning=LLM_REASONING)
 BIG = Backend(OLLAMA_BIG_NAME, OLLAMA_URL_BIG, LLM_MODEL_BIG, OLLAMA_NUM_CTX_BIG, reasoning=True)
 
 # A cold load of the big model from disk takes over a minute; give up after this.
@@ -200,11 +201,11 @@ def _warm_big() -> None:
     state["warming_until"] = time.time() + BIG_WARMUP_TIMEOUT
 
     def run() -> None:
-        body = json.dumps({
+        body = json.dumps(backends.with_shift_disabled({
             "model": LLM_MODEL_BIG,
             "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {"num_ctx": OLLAMA_NUM_CTX_BIG},
-        }).encode()
+        })).encode()
         req = urllib.request.Request(
             f"{OLLAMA_URL_BIG}/api/generate", data=body,
             headers={"Content-Type": "application/json"},
@@ -255,6 +256,8 @@ def get_llm(url: str, model: str, num_ctx: int, temperature: float, reasoning: b
         num_ctx=num_ctx,
         keep_alive=OLLAMA_KEEP_ALIVE,
         reasoning=reasoning,
+        # Same runner options as OpenClaw, so the shared model stays loaded.
+        sync_client_kwargs={"transport": backends.NoShiftTransport()},
     )
 
 

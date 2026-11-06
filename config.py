@@ -9,6 +9,12 @@ WEAVIATE_CLASS_NAME = os.getenv("WEAVIATE_CLASS_NAME", "DocumentConversationAlUs
 # runs with OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0.
 # Fall back to "qwen2.5:3b-instruct" if the GPU turns out to be too tight.
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b-instruct")
+# Thinking for LLM_MODEL: "true" streams its reasoning separately (shows
+# "Thinking..."), "false" turns it off, empty leaves it to the model. Empty is
+# required for models without thinking support (qwen3:4b-instruct rejects
+# true/false); thinking models such as qwen3.5 otherwise think on every reply.
+_LLM_REASONING = os.getenv("LLM_REASONING", "").strip().lower()
+LLM_REASONING = {"true": True, "false": False}.get(_LLM_REASONING)
 EMBEDDER_MODEL = os.getenv("EMBEDDER_MODEL", "nomic-embed-text")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama.default.svc.cluster.local:11434")
