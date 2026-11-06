@@ -29,10 +29,11 @@ from config import (
     CHAT_HISTORY_KEEP,
     CHAT_PINNED_MAX,
     EMBEDDER_MODEL,
+    HISTORY_BUDGET_TOKENS,
+    HISTORY_TRIM_TO_TOKENS,
     LLM_MODEL,
     LLM_MODEL_BIG,
     LLM_REASONING,
-    MAX_HISTORY_MESSAGES,
     OLLAMA_BIG_COOLDOWN,
     OLLAMA_BIG_NAME,
     OLLAMA_BIG_PROBE_TTL,
@@ -397,6 +398,17 @@ def stream_reply(messages) -> tuple[str, Backend, dict]:
     return answer, backend, metadata
 
 
+def refresh_summary(chat: Chat) -> None:
+    """Pick up a summary the idle thread stored since this chat was opened."""
+    try:
+        stored = get_chat_store().load(chat.owner, chat.chat_id)
+    except Exception:
+        log.warning("could not read the summary of chat %s", chat.chat_id, exc_info=True)
+        return
+    if stored and stored.summary_upto > chat.summary_upto:
+        chat.summary, chat.summary_upto = stored.summary, stored.summary_upto
+
+
 def answer(question: str, mode: str) -> None:
     started = time.monotonic()  # the caption shows the whole wait, retrieval included
     chat = current_chat()
@@ -412,7 +424,13 @@ def answer(question: str, mode: str) -> None:
             asked = conversation.user_message(question, [(h.file_name, h.text, h.distance) for h in hits])
             # The question joins the chat only together with its answer, so a
             # failed or interrupted answer leaves the chat as it was.
-            payload = conversation.model_messages((messages + [asked])[-MAX_HISTORY_MESSAGES:])
+            if conversation.prompt_tokens(chat, asked) > HISTORY_BUDGET_TOKENS:
+                refresh_summary(chat)
+            if conversation.fit_window(chat, asked, HISTORY_BUDGET_TOKENS, HISTORY_TRIM_TO_TOKENS,
+                                       summary=chat.summary):
+                log.info("chat %s: window moved to message %d of %d",
+                         chat.chat_id, chat.window_start, len(messages))
+            payload = conversation.window_payload(chat, asked)
 
             reply, backend, metadata = stream_reply(payload)
             elapsed = time.monotonic() - started
@@ -424,7 +442,7 @@ def answer(question: str, mode: str) -> None:
             st.caption(traceback.format_exc())
             return
 
-    usage = conversation.usage_from(metadata)
+    usage = conversation.usage_from(metadata, chat, payload)
     log.info(
         "answer on %s: prompt %d tokens (%d chars) read in %.1fs, %d tokens written in %.1fs, "
         "load %.1fs, wall %.1fs",

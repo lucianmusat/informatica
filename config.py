@@ -53,13 +53,18 @@ RETRIEVAL_MAX_DISTANCE = float(os.getenv("RETRIEVAL_MAX_DISTANCE", "0.50"))
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-# How many prior turns to replay to the model each request.
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
-
 # Saved chats: every pinned chat (up to CHAT_PINNED_MAX) plus the
 # CHAT_HISTORY_KEEP most recently used unpinned ones.
 CHAT_HISTORY_KEEP = int(os.getenv("CHAT_HISTORY_KEEP", "5"))
 CHAT_PINNED_MAX = int(os.getenv("CHAT_PINNED_MAX", "20"))
+
+# What is sent to the model: the chat grows until the prompt passes
+# HISTORY_BUDGET_TOKENS, then the oldest turns are cut in one go down to about
+# HISTORY_TRIM_TO_TOKENS. Cutting in large steps keeps llama.cpp's prompt cache
+# useful: every cut costs one full re-read of the prompt, every other turn only
+# reads the new text. See conversation.py.
+HISTORY_BUDGET_TOKENS = int(os.getenv("HISTORY_BUDGET_TOKENS", "12000"))
+HISTORY_TRIM_TO_TOKENS = int(os.getenv("HISTORY_TRIM_TO_TOKENS", "6000"))
 
 # --------------------------------------------------------------------------
 # Access control
