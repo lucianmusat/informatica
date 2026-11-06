@@ -2,155 +2,124 @@
 
 ![How it looks](static/screenshot.png)
 
-A self-hosted chat assistant running on my local k3s cluster. It started life as a
-pure "talk to your PDFs" RAG toy; it's now a general-purpose chatbot that *also*
-knows about the documents you've given it — ask it to write a shell script and it
-just answers, ask it about your espresso machine manual and it pulls the manual.
+A self-hosted chat assistant that runs on a small home Kubernetes (k3s) cluster.
+It started as a "talk to your PDFs" project and grew into a general-purpose
+chatbot that *also* knows about the documents you've given it: ask it to write a
+shell script and it just answers, ask it about your espresso machine manual and
+it pulls in the relevant parts of the manual.
 
-Runs entirely on my own hardware: Ollama for inference, Weaviate for the vector
-store, Streamlit for the UI.
+Everything runs on local hardware. No data leaves the house.
 
-## How it works
+## Architecture
 
-**Chat.** Every message goes to the model as a proper message list — system prompt,
-prior turns, current question — in a single call. No condense/rephrase step, because
-that extra round-trip both doubled latency and leaked "intermediary questions" into
-the transcript.
+```
+ Browser ── Streamlit app ──┬── Ollama (chat model)      ← always-on GPU node
+                            ├── Ollama (bigger model)    ← optional, when available
+                            ├── Ollama (embedding model)
+                            ├── Weaviate (vector store)
+                            └── Cassandra (users and access requests)
+```
 
-**Retrieval is conditional.** This is the part that makes it feel like a chatbot
-rather than a search box. Each message is embedded and matched against the library
-with a `near_vector` query, which returns a genuine cosine distance. In **Auto** mode
-a chunk is only shown to the model when it lands within `RETRIEVAL_MAX_DISTANCE`, so
-an off-topic question contributes no context at all and gets a normal answer. The
-sidebar can force **Always** or **Never** when the heuristic guesses wrong.
+- **UI:** Streamlit, with answers streamed token by token.
+- **Inference:** Ollama, called through LangChain.
+- **Documents:** Weaviate stores the document chunks and their embeddings.
+- **Users:** Cassandra holds accounts and their access status.
 
-> A note for anyone reading the code: this deliberately does *not* use
-> `WeaviateVectorStore.similarity_search_with_score()`. Despite its docstring
-> promising cosine distance, that method runs a **hybrid** BM25+vector query and
-> returns Weaviate's fused score, which is normalised *within each result set* — the
-> top hit always scores near the top of the range regardless of whether it is
-> relevant. It cannot be thresholded. `rag.retrieve()` queries the collection
-> directly instead.
+### Chat first, documents second
 
-**Ingestion.** PDFs are extracted with PyMuPDF (pypdf as fallback), split
-recursively at ~1000 chars with 200 overlap, embedded with `nomic-embed-text` and
-stored in Weaviate with the file name as metadata so a document can be deleted again
-as a unit.
+Every message goes to the model as a normal conversation (system prompt, recent
+turns and the new question) in a single call.
 
-## Access
+Documents are only added when they are relevant. The question is embedded and
+compared with the user's library. Only chunks that are close enough (by cosine
+distance) are passed to the model, together with the file they came from. An
+off-topic question gets no document context and simply gets a normal answer. A
+sidebar switch can force document use to **Always** or **Never** when the
+automatic choice guesses wrong.
 
-Sign-in is with Google (Streamlit's built-in `st.login`). Anyone can sign in, but
-only approved accounts get past the gate; nothing touches Ollama or Weaviate
-before that check.
+> Implementation note: retrieval queries Weaviate directly for vector distances
+> instead of using LangChain's `similarity_search_with_score()`. That method runs
+> a hybrid query whose scores are normalised per result set, so they can't be
+> used as a relevance threshold.
 
-- **Requests.** A first sign-in creates a `pending` row in Cassandra
-  (`informatica.users`) and emails `ALERT_EMAIL` (via Gmail SMTP, when
-  `SMTP_PASSWORD` is set).
-- **Admin.** `ADMIN_EMAIL` (default `amibadesign@gmail.com`) is always allowed,
-  even if Cassandra is down, and is the only account that sees the **Access
-  requests** page (approve, block, revoke). Status is re-read on every rerun, so a
-  revoke takes effect immediately.
-- **Fail closed.** If Cassandra is unreachable, everyone except the admin is
-  kept out.
-- **Private documents.** Each chunk carries an `owner` (FIELD-tokenized, so the
-  filter is an exact match), and listing, retrieval and deletion are scoped to the
-  signed-in user. Documents from before this change were assigned to the admin.
+### Ingesting documents
 
-The Google client credentials and cookie secret come from env vars
-(`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `COOKIE_SECRET`, `APP_URL`), which
-`write_secrets.py` turns into `.streamlit/secrets.toml` at container start. For
-local development copy `.streamlit/secrets.toml.example` instead.
+Uploaded PDFs are converted to text, split into overlapping chunks, embedded and
+stored in Weaviate. Each chunk is tagged with its file name and its owner, so a
+document can be deleted as a unit and every user only sees their own library.
 
-Tests: `pytest` runs the unit tests; `INFORMATICA_IT=1 CASSANDRA_HOSTS=... WEAVIATE_URL=... pytest`
-also runs the integration tests against real services.
+### Two backends
 
-## Model
+The app can use two Ollama servers: a small always-on one and an optional,
+much faster one on a machine that isn't always running. The bigger backend is
+used only when it is up and already has its model loaded. If it disappears in
+the middle of an answer, the answer restarts on the small backend. Each answer
+shows which model and machine produced it. Embeddings always use the always-on
+server, so stored vectors stay comparable.
 
-Default is **`qwen3:4b-instruct`** — the non-thinking Instruct-2507 build at Q4_K_M.
-Measured on a 4096-token context with `OLLAMA_FLASH_ATTENTION=1` and
-`OLLAMA_KV_CACHE_TYPE=q8_0`:
+### Access control
 
-| | VRAM |
-|---|---|
-| model weights | 2376 MiB |
-| KV cache (q8_0, 4096 ctx) | 306 MiB |
-| compute buffer | 79 MiB |
-| **total** | **2760 MiB** |
+Sign-in is with Google. Anyone can sign in, but only approved accounts can use
+the app; nothing reaches the models or the document store before that check.
 
-With `nomic-embed-text` (~274 MiB) also resident that's ~3.0 GB, which fits the
-cluster's 4 GB card with room to spare. Those two Ollama environment variables matter
-— they're set on the **Ollama server**, not by this app, so they belong in the Ollama
-deployment. Unquantised KV would add another ~306 MiB at this context size.
-
-Drop `LLM_MODEL` back to `qwen2.5:3b-instruct` (1.9 GB weights) if the card turns out
-to be tighter than expected. Mistral 7B, used in an earlier version, does not fit and
-was slow.
-
-### Optional big backend
-
-Set `OLLAMA_URL_BIG` to a second Ollama (in the cluster: the RTX 4090 desktop,
-`ollama-briareos`) and chat uses `LLM_MODEL_BIG` (default `qwen3.8:27b`, 16k
-context) whenever that server answers within 1s and has the model pulled. If it is
-off, or fails mid-answer, the reply is restarted on `OLLAMA_URL` with `LLM_MODEL`,
-and the big backend is skipped for `OLLAMA_BIG_COOLDOWN` seconds. Each answer is
-captioned with the model and machine that produced it. Embeddings always use
-`OLLAMA_URL`, so stored vectors and the retrieval threshold stay valid.
+- A first sign-in creates an access request, and the admin gets an email.
+- The admin approves, blocks or revokes accounts from an in-app page. Changes
+  take effect immediately.
+- If the user database is unreachable, everyone except the admin is kept out.
 
 ## Running it locally
 
-`docker-compose.yml` brings up the whole stack — Ollama with GPU, Weaviate, and the
-app built from the same Dockerfile used in the cluster.
+`docker-compose.yml` brings up the whole stack (Ollama with GPU, Weaviate and
+the app, built from the same Dockerfile used in the cluster):
 
 ```bash
 docker compose up -d ollama weaviate    # backends
-docker compose run --rm model-init      # pull the models (once, ~2.8 GB)
+docker compose run --rm model-init      # pull the models (once)
 docker compose up app                   # http://localhost:8501
 ```
 
-GPU access needs the **native** Docker daemon. If `docker context ls` shows
-`desktop-linux` as current, Docker Desktop's VM has no nvidia runtime — prefix the
-commands with `docker --context default` or `export DOCKER_CONTEXT=default`. Remove
-the `runtime: nvidia` line from the ollama service to fall back to CPU.
+GPU access needs the native Docker daemon with the NVIDIA runtime. Remove the
+`runtime: nvidia` line from the ollama service to run on CPU instead.
 
-To run just the Streamlit app against backends already on localhost, use `./run.sh`.
+To run just the Streamlit app against backends already on localhost, use
+`./run.sh`.
 
-### Tuning the retrieval threshold
+For sign-in, copy `.streamlit/secrets.toml.example` to
+`.streamlit/secrets.toml` and fill in your own Google OAuth client. In the
+container, `write_secrets.py` generates that file from environment variables.
 
-`RETRIEVAL_MAX_DISTANCE` decides when Auto mode pulls in documents. To see where the
-line should sit, `tools/calibrate_retrieval.py` indexes a sample manual and reports
-the distances for a set of on-topic and off-topic questions:
+## Configuration
+
+All settings live in `config.py` and can be overridden with environment
+variables: models, Ollama and Weaviate endpoints, context size, retrieval
+settings, the admin account and email notifications.
+
+`tools/calibrate_retrieval.py` helps choose the distance threshold for automatic
+document use. It indexes a sample manual and reports the distances for on-topic
+and off-topic questions:
 
 ```bash
 docker compose exec app python tools/calibrate_retrieval.py
 ```
 
-## Configuration
+## Tests
 
-Everything lives in `config.py` and is environment-overridable:
-
-| variable | default | meaning |
-|---|---|---|
-| `LLM_MODEL` | `qwen3:4b-instruct` | chat model |
-| `EMBEDDER_MODEL` | `nomic-embed-text` | embedding model |
-| `OLLAMA_URL` | cluster service DNS | Ollama endpoint |
-| `OLLAMA_NUM_CTX` | `4096` | context window |
-| `OLLAMA_TEMPERATURE` | `0.6` | sampling temperature |
-| `WEAVIATE_URL` | cluster service DNS | Weaviate host |
-| `RETRIEVAL_K` | `4` | chunks fetched per query |
-| `RETRIEVAL_MAX_DISTANCE` | `0.50` | Auto-mode cosine distance cutoff |
-| `MAX_HISTORY_MESSAGES` | `20` | turns replayed to the model |
+`pytest` runs the unit tests. Setting `INFORMATICA_IT=1` together with
+`CASSANDRA_HOSTS` and `WEAVIATE_URL` also runs the integration tests against
+real services.
 
 ## See it in action
 
-The page is available [here](http://informatica.lucianmusat.nl/), but because it's
-self-hosted it might not always be up. Be patient — small server, small GPU.
+The app is available [here](https://informatica.lucianmusat.nl/) (Google sign-in,
+access on request). It's self-hosted, so it might not always be up.
 
 ## TODO
 
  - [X] Display LLM answer while it's being generated
  - [X] Work as a general assistant, not only a document search box
- - [ ] Add authentication (I don't want my server to be spammed by randos or bots)
- - [ ] Add multi-tenancy (each user only sees their own documents)
+ - [X] Add authentication (I don't want my server to be spammed by randos or bots)
+ - [X] Add multi-tenancy (each user only sees their own documents)
+ - [X] Use a bigger model on a second GPU when it's available
  - [ ] Prefix embeddings with `search_query:` / `search_document:` as nomic-embed-text
-       expects — needs a full re-index of existing documents, so it's a breaking change
+       expects. Needs a full re-index of existing documents, so it's a breaking change
  - [ ] Support more than PDFs (txt, markdown, epub)
