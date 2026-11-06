@@ -630,31 +630,37 @@ def render_recent_chats() -> None:
 
     open_id = current_chat().chat_id
     pin_full = sum(c.pinned for c in chats) >= CHAT_PINNED_MAX
-    for heading, group in (("Pinned", [c for c in chats if c.pinned]),
-                           ("Recent chats", [c for c in chats if not c.pinned])):
-        if not group:
-            continue
-        st.caption(heading)
-        for info in group:
-            title, pin, remove = st.columns([6, 1, 1], vertical_alignment="center")
-            title.button(
-                info.title, key=f"chat-open-{info.chat_id}", on_click=_open_chat, args=(info.chat_id,),
-                # The open chat is the only one drawn as a button; the rest read as links.
-                type="secondary" if info.chat_id == open_id else "tertiary",
-                use_container_width=True,
-            )
-            pin.button(
-                "📌", key=f"chat-pin-{info.chat_id}", on_click=_pin_chat,
-                args=(info.chat_id, not info.pinned),
-                type="secondary" if info.pinned else "tertiary",
-                help="Unpin" if info.pinned else (
-                    f"At most {CHAT_PINNED_MAX} pinned chats" if pin_full else "Pin: keep this chat"),
-                disabled=pin_full and not info.pinned,
-            )
-            remove.button(
-                "✕", key=f"chat-rm-{info.chat_id}", on_click=_delete_chat, args=(info.chat_id,),
-                type="tertiary", help="Delete this chat",
-            )
+    # Every button here is a borderless "tertiary" one; the keys tell the
+    # stylesheet which title is the open chat and which pins are on (see
+    # html_templates, "Saved chats").
+    with st.container(key="recent-chats"):
+        for heading, group in (("Pinned", [c for c in chats if c.pinned]),
+                               ("Recent chats", [c for c in chats if not c.pinned])):
+            if group:
+                st.caption(heading)
+                for info in group:
+                    _chat_row(info, info.chat_id == open_id, pin_full)
+
+
+def _chat_row(info, is_open: bool, pin_full: bool) -> None:
+    title, pin, remove = st.columns([6, 1, 1], gap="small", vertical_alignment="center")
+    title.button(
+        info.title, key=f"chat-{'current' if is_open else 'open'}-{info.chat_id}",
+        on_click=_open_chat, args=(info.chat_id,), type="tertiary", help=info.title,
+        use_container_width=True,
+    )
+    pin.button(
+        "📌", key=f"chat-{'pinned' if info.pinned else 'pin'}-{info.chat_id}", on_click=_pin_chat,
+        args=(info.chat_id, not info.pinned),
+        type="tertiary",
+        help="Unpin" if info.pinned else (
+            f"At most {CHAT_PINNED_MAX} pinned chats" if pin_full else "Pin: keep this chat"),
+        disabled=pin_full and not info.pinned,
+    )
+    remove.button(
+        "✕", key=f"chat-rm-{info.chat_id}", on_click=_delete_chat, args=(info.chat_id,),
+        type="tertiary", help="Delete this chat",
+    )
 
 
 # --------------------------------------------------------------------------

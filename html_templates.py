@@ -182,6 +182,68 @@ css = f"""
     40%           {{ transform: translateY(-5px); opacity: 1; }}
 }}
 
+/* ---- Saved chats (sidebar) ---------------------------------------- */
+/* Titles are borderless buttons drawn as a compact list: one line each, cut
+   off with an ellipsis (the full title is the hover tooltip). The open chat
+   is brighter and bold; the others are dimmed until hovered. */
+.st-key-recent-chats {{
+    gap: 0.1rem;
+}}
+.st-key-recent-chats [data-testid="stColumn"] {{
+    min-width: 0;
+}}
+.st-key-recent-chats button {{
+    min-height: 1.7rem;
+    padding: 0.1rem 0.3rem;
+}}
+.st-key-recent-chats button p {{
+    font-size: 0.82rem;
+}}
+[class*="st-key-chat-open-"] button,
+[class*="st-key-chat-current-"] button {{
+    justify-content: flex-start;
+    min-width: 0;
+    overflow: hidden;
+}}
+[class*="st-key-chat-open-"] button > div,
+[class*="st-key-chat-current-"] button > div {{
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    justify-content: flex-start;
+}}
+[class*="st-key-chat-open-"] button p,
+[class*="st-key-chat-current-"] button p {{
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: left !important;
+    width: 100%;
+}}
+[class*="st-key-chat-open-"] button,
+[class*="st-key-chat-pin-"] button,
+[class*="st-key-chat-rm-"] button {{
+    color: inherit !important;
+    opacity: 0.6;
+}}
+[class*="st-key-chat-open-"] button:hover,
+[class*="st-key-chat-pin-"] button:hover:not(:disabled),
+[class*="st-key-chat-rm-"] button:hover {{
+    opacity: 1;
+}}
+[class*="st-key-chat-current-"] button {{
+    color: inherit !important;
+    opacity: 1;
+}}
+[class*="st-key-chat-current-"] button p {{
+    font-weight: 600;
+}}
+/* An unpinned chat's pin is a faint grey outline of the pinned one. */
+[class*="st-key-chat-pin-"] button {{
+    filter: grayscale(1);
+    opacity: 0.35;
+}}
+
 /* Hide the "Press Enter to submit" hint that clutters the composer. */
 [data-testid="InputInstructions"] {{ display: none; }}
 </style>
