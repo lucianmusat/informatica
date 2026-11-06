@@ -66,9 +66,13 @@ continues the previous one exactly:
 
 ### Ingesting documents
 
-Uploaded PDFs are converted to text, split into overlapping chunks, embedded and
-stored in Weaviate. Each chunk is tagged with its file name and its owner, so a
-document can be deleted as a unit and every user only sees their own library.
+PDF, Word (.docx), text and Markdown (.md) files can be dropped into the message box (or
+uploaded from the sidebar). When the message is sent they are converted to
+text, split into overlapping chunks, embedded and stored in Weaviate; a file
+that can't be read gets an error notification. Each chunk is tagged with its
+file name and its owner, so a document can be deleted or replaced as a unit
+and every user only sees their own library. The message a file was attached
+to always draws on that file; later messages use the whole library as usual.
 
 ### Two backends
 
@@ -144,4 +148,4 @@ access on request). It's self-hosted, so it might not always be up.
  - [X] Use a bigger model on a second GPU when it's available
  - [ ] Prefix embeddings with `search_query:` / `search_document:` as nomic-embed-text
        expects. Needs a full re-index of existing documents, so it's a breaking change
- - [ ] Support more than PDFs (txt, markdown, epub)
+ - [X] Support more than PDFs (Word and text files, dropped into the chat)

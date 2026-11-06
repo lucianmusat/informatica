@@ -2,7 +2,8 @@
 
 A chat is a list of plain dicts, so it can be stored as JSON:
 
-    {"role": "user", "content": question, "excerpts": [[file, text, distance], ...]}
+    {"role": "user", "content": question, "excerpts": [[file, text, distance], ...],
+     "files": [names attached to this message]}  # "files" only when there were any
     {"role": "assistant", "content": answer, "caption": "...", "usage": {...}}
 
 User and assistant messages strictly alternate (a question is added only
@@ -27,13 +28,17 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 import prompts
 
 
-def user_message(question: str, excerpts) -> dict:
-    return {"role": "user", "content": question, "excerpts": [list(e) for e in excerpts]}
+def user_message(question: str, excerpts, files=()) -> dict:
+    message = {"role": "user", "content": question, "excerpts": [list(e) for e in excerpts]}
+    if files:
+        message["files"] = list(files)
+    return message
 
 
 def model_message(message: dict) -> BaseMessage:
     if message["role"] == "user":
-        return HumanMessage(content=prompts.user_content(message["content"], message.get("excerpts")))
+        return HumanMessage(content=prompts.user_content(
+            message["content"], message.get("excerpts"), message.get("files")))
     return AIMessage(content=message["content"])
 
 

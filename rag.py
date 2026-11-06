@@ -103,33 +103,54 @@ def _owned_by(owner: str):
     return Filter.by_property(OWNER).equal(owner)
 
 
-def store_document(vectorstore, file_name: str, text: str, owner: str) -> int:
-    """Embed and persist one document for ``owner``. Returns chunks stored."""
+def store_document(vectorstore, file_name: str, text: str, owner: str, *, client=None,
+                   class_name: str | None = None) -> int:
+    """Embed and persist one document for ``owner``. Returns chunks stored.
+
+    With ``client`` and ``class_name``, an earlier upload of the same file by
+    the same owner is replaced: the old chunks are deleted only after the new
+    ones are stored, so the document never disappears in between. Another
+    user's file of the same name is never touched.
+    """
     chunks = split_text(text)
     if not chunks:
         return 0
+    old = _ids_of(client.collections.get(class_name), file_name, owner) if client else []
     vectorstore.add_texts(
         chunks, metadatas=[{"fileName": file_name, OWNER: owner} for _ in chunks]
     )
+    if old:
+        client.collections.get(class_name).data.delete_many(where=Filter.by_id().contains_any(old))
     return len(chunks)
 
 
 def retrieve(
-    client, embeddings, class_name: str, query: str, k: int, *, owner: str | None
+    client, embeddings, class_name: str, query: str, k: int, *, owner: str | None,
+    files: list[str] | None = None,
 ) -> list[Hit]:
     """Nearest chunks by cosine distance, closest first.
 
     ``owner`` is required on purpose: the app always passes the signed-in user.
     ``None`` (no filter) is only for single-tenant collections such as the
     calibration tool's.
+
+    ``files`` limits the search to those of the owner's files. fileName is
+    WORD-tokenized, so the filter can also let through similarly named files
+    ("a.pdf" matches "a b.pdf"); more candidates are fetched and the names are
+    checked exactly here.
     """
     collection = client.collections.get(class_name)
     vector = embeddings.embed_query(query)
 
+    filters = _owned_by(owner) if owner is not None else None
+    if files:
+        by_name = Filter.any_of([Filter.by_property("fileName").equal(f) for f in files])
+        filters = by_name if filters is None else filters & by_name
+
     result = collection.query.near_vector(
         near_vector=vector,
-        limit=k,
-        filters=_owned_by(owner) if owner is not None else None,
+        limit=k * 5 if files else k,
+        filters=filters,
         return_metadata=MetadataQuery(distance=True),
     )
 
@@ -137,7 +158,7 @@ def retrieve(
     for obj in result.objects:
         props = obj.properties or {}
         text = props.get("text") or props.get("body") or ""
-        if not text:
+        if not text or files and props.get("fileName") not in files:
             continue
         distance = obj.metadata.distance
         hits.append(
@@ -148,7 +169,7 @@ def retrieve(
                 distance=float(distance) if distance is not None else 2.0,
             )
         )
-    return hits
+    return hits[:k]
 
 
 def list_documents(client, class_name: str, owner: str) -> list[str]:
@@ -169,16 +190,21 @@ def delete_document(client, class_name: str, file_name: str, owner: str) -> int:
     delete goes by id.
     """
     collection = client.collections.get(class_name)
+    ids = _ids_of(collection, file_name, owner)
+    if not ids:
+        return 0
+    result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
+    return result.matches
+
+
+def _ids_of(collection, file_name: str, owner: str) -> list:
+    """Ids of every chunk of exactly ``file_name`` owned by ``owner``."""
     candidates = collection.query.fetch_objects(
         filters=_owned_by(owner) & Filter.by_property("fileName").equal(file_name),
         return_properties=["fileName"],
         limit=10_000,
     )
-    ids = [
+    return [
         o.uuid for o in candidates.objects
         if (o.properties or {}).get("fileName") == file_name
     ]
-    if not ids:
-        return 0
-    result = collection.data.delete_many(where=Filter.by_id().contains_any(ids))
-    return result.matches

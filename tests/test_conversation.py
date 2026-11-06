@@ -148,3 +148,11 @@ def test_window_of_one_oversized_exchange_drops_it():
     c.window_start = 4
     assert conversation.fit_window(c, ASK, 12000, 6000)
     assert c.window_start == 6
+
+
+def test_attached_files_are_named_after_the_question():
+    message = conversation.user_message("Summarise this", [EXCERPT], files=["manual.pdf"])
+    content = conversation.model_message(message).content
+    assert content.endswith("Summarise this\n\n(Attached: manual.pdf)")
+    assert content.startswith("<retrieved_excerpts>")
+    assert "files" not in conversation.user_message("hi", [])

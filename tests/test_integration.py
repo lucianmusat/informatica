@@ -164,3 +164,34 @@ def test_existing_collection_is_migrated_to_admin(weaviate_client):
     assert rag.assign_unowned(weaviate_client, COLL, "admin@x.com") == 0
     assert rag.list_documents(weaviate_client, COLL, "admin@x.com") == ["old.pdf"]
     assert rag.list_documents(weaviate_client, COLL, "someone@x.com") == []
+
+
+def test_attached_files_retrieval_and_replacement(weaviate_client):
+    import rag
+
+    weaviate_client.collections.create(COLL, properties=rag.collection_properties())
+    vs, emb = _store(weaviate_client), FakeEmbeddings()
+
+    def store(name, text, owner):
+        return rag.store_document(vs, name, text, owner=owner, client=weaviate_client, class_name=COLL)
+
+    store("a.pdf", "alpha one", "bob@gmail.com")
+    store("a b.pdf", "beta two", "bob@gmail.com")
+    store("a.pdf", "eve's alpha", "eve@gmail.com")
+
+    def names(owner, files):
+        hits = rag.retrieve(weaviate_client, emb, COLL, "anything", 4, owner=owner, files=files)
+        return {(h.file_name, h.text) for h in hits}
+
+    # Only the named file, never the similarly named one, never another user's.
+    assert names("bob@gmail.com", ["a.pdf"]) == {("a.pdf", "alpha one")}
+    assert names("eve@gmail.com", ["a.pdf"]) == {("a.pdf", "eve's alpha")}
+    assert names("eve@gmail.com", ["a b.pdf"]) == set()
+    assert names("bob@gmail.com", ["a.pdf", "a b.pdf"]) == {("a.pdf", "alpha one"), ("a b.pdf", "beta two")}
+
+    # Re-uploading replaces the owner's copy only.
+    store("a.pdf", "alpha new", "bob@gmail.com")
+    assert names("bob@gmail.com", ["a.pdf"]) == {("a.pdf", "alpha new")}
+    assert names("eve@gmail.com", ["a.pdf"]) == {("a.pdf", "eve's alpha")}
+    assert names("bob@gmail.com", ["a b.pdf"]) == {("a b.pdf", "beta two")}
+    assert rag.list_documents(weaviate_client, COLL, "eve@gmail.com") == ["a.pdf"]

@@ -58,7 +58,7 @@ from config import (
     WEAVIATE_URL,
 )
 from html_templates import DISMISS_KEYBOARD_ON_SEND, THINKING_INDICATOR, TYPING_INDICATOR, css
-from pdf_utils import extract_documents
+from extract import FILE_TYPES, ExtractError, extract
 from timing import format_duration
 
 LOGO = "static/logo.png"
@@ -330,12 +330,26 @@ def start_summarizer(_store: CassandraChatStore) -> Summarizer:
 # Chat
 # --------------------------------------------------------------------------
 
-def gather_context(question: str, mode: str) -> list[rag.Hit]:
+def gather_context(question: str, mode: str, files: list[str] | None = None) -> list[rag.Hit]:
     """Retrieved excerpts for this turn, honouring the sidebar retrieval mode.
 
     "Auto" keeps only chunks within RETRIEVAL_MAX_DISTANCE of the question, so a
     message that has nothing to do with the library contributes no context at all.
+
+    A message that came with attached ``files`` draws only on those files, and
+    always: the user attached them to be used, so neither the mode nor the
+    distance threshold applies.
     """
+    if files:
+        try:
+            return rag.retrieve(
+                get_weaviate_client(), get_embeddings(), WEAVIATE_CLASS_NAME, question,
+                RETRIEVAL_K, owner=current_owner(), files=files,
+            )
+        except Exception:
+            log.warning("retrieval from attached files failed", exc_info=True)
+            return []
+
     if mode == "Never":
         return []
 
@@ -433,7 +447,41 @@ def refresh_summary(chat: Chat) -> None:
         chat.summary, chat.summary_upto = stored.summary, stored.summary_upto
 
 
-def answer(question: str, mode: str) -> None:
+def index_files(uploads) -> list[tuple[str, int]]:
+    """Parse and embed uploaded files into the signed-in user's library.
+
+    Returns (name, chunks) for each file stored. A file that can't be read gets
+    an error notification and is skipped; the others still go in. Uploading a
+    file with the name of one already in the user's library replaces it.
+    """
+    stored = []
+    for upload in uploads or []:
+        name = upload.name
+        try:
+            text = extract(name, upload.getvalue())
+            with st.spinner(f"Indexing {name}…"):
+                started = time.monotonic()
+                chunks = rag.store_document(
+                    get_vectorstore(), name, text, owner=current_owner(),
+                    client=get_weaviate_client(), class_name=WEAVIATE_CLASS_NAME,
+                )
+            log.info("indexed %s: %d chars, %d chunks in %.1fs",
+                     name, len(text), chunks, time.monotonic() - started)
+            stored.append((name, chunks))
+        except ExtractError as exc:
+            st.toast(f"**{name}** could not be read: {exc}.", icon="⚠️")
+        except Exception as exc:
+            log.warning("indexing %s failed", name, exc_info=True)
+            st.toast(f"**{name}** could not be added to your library ({type(exc).__name__}).", icon="⚠️")
+    return stored
+
+
+def render_attachments(files: list[str]) -> None:
+    if files:
+        st.caption(" · ".join(f"📎 {name}" for name in files))
+
+
+def answer(question: str, mode: str, uploads=()) -> None:
     started = time.monotonic()  # the caption shows the whole wait, retrieval included
     chat = current_chat()
     messages = chat.messages
@@ -441,11 +489,14 @@ def answer(question: str, mode: str) -> None:
 
     with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(question)
+        files = [name for name, _ in index_files(uploads)]
+        render_attachments(files)
 
     with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR), get_activity():
         try:
-            hits = gather_context(question, mode)
-            asked = conversation.user_message(question, [(h.file_name, h.text, h.distance) for h in hits])
+            hits = gather_context(question, mode, files)
+            asked = conversation.user_message(question, [(h.file_name, h.text, h.distance) for h in hits],
+                                              files)
             # The question joins the chat only together with its answer, so a
             # failed or interrupted answer leaves the chat as it was.
             if conversation.prompt_tokens(chat, asked) > HISTORY_BUDGET_TOKENS:
@@ -490,6 +541,7 @@ def replay_history() -> None:
         if message["role"] == "user":
             with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
                 st.markdown(message["content"])
+                render_attachments(message.get("files") or [])
         else:
             with turn("assistant", index), st.chat_message("assistant", avatar=BOT_AVATAR):
                 st.markdown(message["content"].strip())
@@ -508,39 +560,17 @@ def render_sidebar(client) -> str:
         st.subheader("Documents")
 
         uploads = st.file_uploader(
-            "Upload PDFs", type=["pdf"], accept_multiple_files=True
+            "Upload documents", type=list(FILE_TYPES), accept_multiple_files=True,
+            help="PDF, Word (.docx), text or Markdown files. You can also drop them into the message box.",
         )
         if st.button("Process", use_container_width=True, disabled=not uploads):
-            vectorstore = get_vectorstore()
-            for name, text in extract_documents(uploads).items():
-                if not text.strip():
-                    st.warning(f"No extractable text in {name} — is it a scan?")
-                    continue
-                with st.spinner(f"Indexing {name}…"):
-                    try:
-                        chunks = rag.store_document(vectorstore, name, text, owner=current_owner())
-                        st.success(f"{name} — {chunks} chunks")
-                    except Exception as exc:
-                        st.error(f"{name}: {exc}")
+            for name, chunks in index_files(uploads):
+                st.success(f"{name} — {chunks} chunks")
 
-        documents = []
-        try:
-            documents = rag.list_documents(client, WEAVIATE_CLASS_NAME, current_owner())
-        except Exception as exc:
-            st.error(f"Could not list documents: {exc}")
-
-        if documents:
-            st.caption("In your library")
-            for name in documents:
-                row, remove = st.columns([5, 1])
-                row.write(name)
-                if remove.button("✕", key=f"rm_{name}", help=f"Remove {name}"):
-                    with st.spinner(f"Removing {name}…"):
-                        deleted = rag.delete_document(client, WEAVIATE_CLASS_NAME, name, current_owner())
-                    st.toast(f"Removed {name} ({deleted} chunks)")
-                    st.rerun()
-        else:
-            st.caption("No documents yet — the assistant still answers normally.")
+        documents = _documents(client)
+        # Filled at the end of the run, so files attached to a message in this
+        # run are already listed. See chat_page.
+        library = st.empty()
 
         st.divider()
 
@@ -577,7 +607,31 @@ def render_sidebar(client) -> str:
         except Exception:
             st.caption("Weaviate · `unreachable`")
 
-    return mode, recent
+    return mode, recent, library
+
+
+def _documents(client) -> list[str]:
+    try:
+        return rag.list_documents(client, WEAVIATE_CLASS_NAME, current_owner())
+    except Exception as exc:
+        st.error(f"Could not list documents: {exc}")
+        return []
+
+
+def render_library(client) -> None:
+    documents = _documents(client)
+    if not documents:
+        st.caption("No documents yet — the assistant still answers normally.")
+        return
+    st.caption("In your library")
+    for name in documents:
+        row, remove = st.columns([5, 1])
+        row.write(name)
+        if remove.button("✕", key=f"rm_{name}", help=f"Remove {name}"):
+            with st.spinner(f"Removing {name}…"):
+                deleted = rag.delete_document(client, WEAVIATE_CLASS_NAME, name, current_owner())
+            st.toast(f"Removed {name} ({deleted} chunks)")
+            st.rerun()
 
 
 def _new_chat() -> None:
@@ -835,11 +889,15 @@ def chat_page() -> None:
         )
         return
 
-    mode, recent = render_sidebar(client)
+    mode, recent, library = render_sidebar(client)
 
     # st.chat_input pins itself to the bottom wherever it is called, so reading
     # it first lets this run know a question is incoming and skip the greeting.
-    question = st.chat_input("Message Informatica…")
+    submitted = st.chat_input(
+        "Message Informatica…", accept_file="multiple", file_type=list(FILE_TYPES),
+    )
+    question = (submitted.text if submitted else "").strip()
+    uploads = list(submitted.files) if submitted else []
     st.html(DISMISS_KEYBOARD_ON_SEND, unsafe_allow_javascript=True)
 
     # The greeting gets a slot of its own that every run writes, empty or not.
@@ -847,21 +905,28 @@ def chat_page() -> None:
     # Streamlit leaves the greeting's old heading and caption inside it, faded,
     # until the whole answer has streamed.
     welcome = st.empty()
-    if not current_chat().messages and not question:
+    if not current_chat().messages and not (question or uploads):
         # Keyed so the stylesheet can centre the whole block; see html_templates.
         with welcome.container(key="welcome"):
             st.image(LOGO, width=76)
             st.markdown("#### What can I help you with?")
             st.caption(
-                "Ask me anything. Upload PDFs in the sidebar and I'll draw on them "
-                "when they're relevant."
+                "Ask me anything. Drop PDF, Word, text or Markdown files into the message box "
+                "and I'll draw on them."
             )
 
     replay_history()
 
-    if question and question.strip():
-        answer(question.strip(), mode)
+    if question:
+        answer(question, mode, uploads)
+    elif uploads:
+        # Files without a message only go into the library.
+        added = index_files(uploads)
+        if added:
+            st.toast("Added to your library: " + ", ".join(name for name, _ in added), icon="📎")
 
+    with library.container():
+        render_library(client)
     with recent.container():
         render_recent_chats()
 

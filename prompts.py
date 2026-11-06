@@ -26,7 +26,8 @@ and headings when they aid scanning, not by reflex.
 If you don't know something or aren't sure, say so plainly instead of inventing an \
 answer.
 
-The user has a personal document library. Some user messages start with a \
+The user has a personal document library. Files they attach to a message are \
+added to it and named at the end of that message. Some user messages start with a \
 <retrieved_excerpts> block: passages retrieved automatically as possibly relevant \
 to that message. The user has not necessarily read them or asked about them. Use an \
 excerpt only if it genuinely helps answer the question, and name the file it came \
@@ -54,12 +55,15 @@ def system_prompt(summary: str = "") -> str:
     return f"{SYSTEM_PROMPT}\n\n---\n\n{SUMMARY_PREAMBLE}\n\n{summary}"
 
 
-def user_content(question: str, excerpts) -> str:
-    """What the model sees for one user turn: excerpts first, then the question.
+def user_content(question: str, excerpts, files=None) -> str:
+    """What the model sees for one user turn: excerpts first, then the question,
+    then the names of files attached to it (so "this file" means something).
 
     ``excerpts`` are (file_name, text, distance) triples, as stored in the chat.
     The output must be identical every time it is built for the same turn.
     """
+    if files:
+        question = f"{question}\n\n(Attached: {', '.join(files)})"
     if not excerpts:
         return question
     blocks = [
