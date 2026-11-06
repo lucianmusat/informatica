@@ -94,9 +94,6 @@ css = f"""
 [class*="st-key-welcome"] img {{
     border-radius: 20px;
 }}
-body.informatica-sent [class*="st-key-welcome"] {{
-    display: none !important;
-}}
 [class*="st-key-welcome"] h4 {{
     padding-top: 0.9rem;
     padding-bottom: 0.2rem;
@@ -204,45 +201,25 @@ THINKING_INDICATOR = (
     "</span>"
 )
 
-# Runs once per page. On send:
-# - hides the welcome greeting straight away. Streamlit only removes it when the
-#   rerun reaches it and shows it faded until then, which on a phone can take a
-#   while. The class is dropped again once the greeting is gone, so "New chat"
-#   shows it normally.
-# - on touch devices, closes the keyboard so the conversation stays in view.
-ON_SEND_SCRIPT = """
+DISMISS_KEYBOARD_ON_SEND = """
 <script>
 (() => {
-  if (window.__informaticaOnSend) return;
-  window.__informaticaOnSend = true;
-  const touch = window.matchMedia("(hover: none) and (pointer: coarse)").matches;
-  const WELCOME = '[class*="st-key-welcome"]';
-  const SENT = "informatica-sent";
-  const input = () => document.querySelector('[data-testid="stChatInput"] textarea');
+  if (window.__informaticaKeyboardFix) return;
+  window.__informaticaKeyboardFix = true;
+  if (!window.matchMedia("(hover: none) and (pointer: coarse)").matches) return;
 
-  const onSend = () => {
-    const box = input();
-    if (!box || !box.value.trim()) return;
-    if (document.querySelector(WELCOME)) document.body.classList.add(SENT);
-    if (touch) setTimeout(() => {
-      const active = document.activeElement;
-      if (active && active.closest('[data-testid="stChatInput"]')) active.blur();
-      window.scrollTo(0, 0);
-    }, 0);
-  };
-
-  new MutationObserver(() => {
-    if (document.body.classList.contains(SENT) && !document.querySelector(WELCOME)) {
-      document.body.classList.remove(SENT);
-    }
-  }).observe(document.body, { childList: true, subtree: true });
+  const dismiss = () => setTimeout(() => {
+    const active = document.activeElement;
+    if (active && active.closest('[data-testid="stChatInput"]')) active.blur();
+    window.scrollTo(0, 0);
+  }, 0);
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing &&
-        e.target.closest && e.target.closest('[data-testid="stChatInput"]')) onSend();
+        e.target.closest && e.target.closest('[data-testid="stChatInput"]')) dismiss();
   }, true);
   document.addEventListener("click", (e) => {
-    if (e.target.closest && e.target.closest('[data-testid="stChatInputSubmitButton"]')) onSend();
+    if (e.target.closest && e.target.closest('[data-testid="stChatInputSubmitButton"]')) dismiss();
   }, true);
 })();
 </script>

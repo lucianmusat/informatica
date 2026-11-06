@@ -50,7 +50,7 @@ from config import (
     WEAVIATE_HTTP_SECURE,
     WEAVIATE_URL,
 )
-from html_templates import ON_SEND_SCRIPT, THINKING_INDICATOR, TYPING_INDICATOR, css
+from html_templates import DISMISS_KEYBOARD_ON_SEND, THINKING_INDICATOR, TYPING_INDICATOR, css
 from pdf_utils import extract_documents
 from timing import format_duration
 
@@ -651,11 +651,16 @@ def chat_page() -> None:
     # st.chat_input pins itself to the bottom wherever it is called, so reading
     # it first lets this run know a question is incoming and skip the greeting.
     question = st.chat_input("Message Informatica…")
-    st.html(ON_SEND_SCRIPT, unsafe_allow_javascript=True)
+    st.html(DISMISS_KEYBOARD_ON_SEND, unsafe_allow_javascript=True)
 
+    # The greeting gets a slot of its own that every run writes, empty or not.
+    # Without it, the first chat message takes over the greeting's position and
+    # Streamlit leaves the greeting's old heading and caption inside it, faded,
+    # until the whole answer has streamed.
+    welcome = st.empty()
     if not st.session_state.messages and not question:
         # Keyed so the stylesheet can centre the whole block; see html_templates.
-        with st.container(key="welcome"):
+        with welcome.container(key="welcome"):
             st.image(LOGO, width=76)
             st.markdown("#### What can I help you with?")
             st.caption(
