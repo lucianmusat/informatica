@@ -123,6 +123,26 @@ def fit_window(chat, asked: dict, budget: int, trim_to: int, summary: str = "") 
     return True
 
 
+def reopen_window(chat, keep_exchanges: int) -> bool:
+    """Start a reopened chat from its summary and the last ``keep_exchanges``.
+
+    Turns after ``summary_upto`` are never dropped (the summary may be older
+    than the chat), and the window never moves back. Returns True when the
+    window changed; the first answer then reads the whole, smaller, prompt.
+    """
+    if not chat.summary:
+        return False
+    keep_from = max(len(chat.messages) - 2 * keep_exchanges, 0)
+    start = max(chat.window_start, min(chat.summary_upto, keep_from))
+    start -= start % 2
+    if start == 0:
+        return False  # the whole chat fits; the summary would only repeat it
+    if start == chat.window_start and chat.window_summary == chat.summary:
+        return False
+    chat.window_start, chat.window_summary = start, chat.summary
+    return True
+
+
 def usage_from(metadata: dict | None, chat=None, payload: list[BaseMessage] | None = None) -> dict:
     """Token counts and timings from the final chunk of an Ollama stream.
 

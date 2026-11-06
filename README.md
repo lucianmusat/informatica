@@ -17,13 +17,14 @@ Everything runs on local hardware. No data leaves the house.
                             ├── Ollama (bigger model)    ← optional, when available
                             ├── Ollama (embedding model)
                             ├── Weaviate (vector store)
-                            └── Cassandra (users and access requests)
+                            └── Cassandra (users, access requests, saved chats)
 ```
 
 - **UI:** Streamlit, with answers streamed token by token.
 - **Inference:** Ollama, called through LangChain.
 - **Documents:** Weaviate stores the document chunks and their embeddings.
-- **Users:** Cassandra holds accounts and their access status.
+- **Users and chats:** Cassandra holds accounts, their access status and
+  each user's saved chats.
 
 ### Chat first, documents second
 
@@ -41,6 +42,27 @@ automatic choice guesses wrong.
 > instead of using LangChain's `similarity_search_with_score()`. That method runs
 > a hybrid query whose scores are normalised per result set, so they can't be
 > used as a relevance threshold.
+
+### Chat history and long chats
+
+Each user keeps their pinned chats plus their 5 most recently used others,
+listed in the sidebar to reopen, pin or delete. Users only see their own
+chats, and blocking a user deletes theirs.
+
+The chat model runs on a small GPU that reads prompts slowly, so long chats
+are built around llama.cpp's prompt cache, which only helps when a prompt
+continues the previous one exactly:
+
+- The system prompt never changes. Retrieved excerpts go into the turn they
+  were found for and stay in the history.
+- Only a window of the chat is sent. It grows at the end until the prompt
+  passes ~12k tokens (Ollama's real count), then the oldest turns are cut in
+  one go down to ~6k. That costs one full re-read every few thousand tokens
+  instead of one every turn.
+- A chat idle for 15 minutes gets a summary from a background thread. The
+  request is the chat's last prompt plus "summarise this", so it is usually
+  served from the cache. The summary goes in front of the window after a cut,
+  and a reopened chat starts from the summary plus the last 2 exchanges.
 
 ### Ingesting documents
 

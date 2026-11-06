@@ -66,6 +66,13 @@ CHAT_PINNED_MAX = int(os.getenv("CHAT_PINNED_MAX", "20"))
 HISTORY_BUDGET_TOKENS = int(os.getenv("HISTORY_BUDGET_TOKENS", "12000"))
 HISTORY_TRIM_TO_TOKENS = int(os.getenv("HISTORY_TRIM_TO_TOKENS", "6000"))
 
+# A chat idle this long gets a summary of the whole chat (summarizer.py),
+# checked every SUMMARY_SCAN_SECONDS. A reopened chat with a summary starts from
+# it plus the last REOPEN_KEEP_EXCHANGES question/answer pairs.
+SUMMARY_IDLE_MINUTES = int(os.getenv("SUMMARY_IDLE_MINUTES", "15"))
+SUMMARY_SCAN_SECONDS = int(os.getenv("SUMMARY_SCAN_SECONDS", "180"))
+REOPEN_KEEP_EXCHANGES = int(os.getenv("REOPEN_KEEP_EXCHANGES", "2"))
+
 # --------------------------------------------------------------------------
 # Access control
 # --------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import rag
 from access import Access, check_access
 from notify import alert_new_user
 from chats import CassandraChatStore, Chat
+from summarizer import Activity, Summarizer
 from users import APPROVED, BLOCKED, PENDING, CassandraUserStore
 from config import (
     ADMIN_EMAIL,
@@ -45,7 +46,10 @@ from config import (
     OLLAMA_URL,
     OLLAMA_URL_BIG,
     RETRIEVAL_K,
+    REOPEN_KEEP_EXCHANGES,
     RETRIEVAL_MAX_DISTANCE,
+    SUMMARY_IDLE_MINUTES,
+    SUMMARY_SCAN_SECONDS,
     WEAVIATE_CLASS_NAME,
     WEAVIATE_GRPC_PORT,
     WEAVIATE_GRPC_SECURE,
@@ -302,6 +306,26 @@ def get_llm(url: str, model: str, num_ctx: int, temperature: float, reasoning: b
     )
 
 
+@st.cache_resource(show_spinner=False)
+def get_activity() -> Activity:
+    return Activity()
+
+
+@st.cache_resource(show_spinner=False)
+def start_summarizer(_store: CassandraChatStore) -> Summarizer:
+    """Once per process. Uses the small backend's own LLM object, so summaries
+    run on the same Ollama runner as chat."""
+    summarizer = Summarizer(
+        _store,
+        get_llm(SMALL.url, SMALL.model, SMALL.num_ctx, OLLAMA_TEMPERATURE, SMALL.reasoning),
+        idle_minutes=SUMMARY_IDLE_MINUTES,
+        keep_exchanges=REOPEN_KEEP_EXCHANGES,
+        is_busy=lambda: get_activity().busy,
+    )
+    summarizer.start(SUMMARY_SCAN_SECONDS)
+    return summarizer
+
+
 # --------------------------------------------------------------------------
 # Chat
 # --------------------------------------------------------------------------
@@ -418,7 +442,7 @@ def answer(question: str, mode: str) -> None:
     with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
         st.markdown(question)
 
-    with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR):
+    with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR), get_activity():
         try:
             hits = gather_context(question, mode)
             asked = conversation.user_message(question, [(h.file_name, h.text, h.distance) for h in hits])
@@ -561,6 +585,8 @@ def _new_chat() -> None:
 
 
 def _open_chat(chat_id) -> None:
+    if current_chat().chat_id == chat_id:
+        return
     try:
         chat = get_chat_store().load(current_owner(), chat_id)
     except Exception as exc:
@@ -569,6 +595,9 @@ def _open_chat(chat_id) -> None:
     if chat is None:
         st.toast("That chat no longer exists.", icon="⚠️")
         return
+    if conversation.reopen_window(chat, REOPEN_KEEP_EXCHANGES):
+        log.info("chat %s reopened from its summary at message %d of %d",
+                 chat.chat_id, chat.window_start, chat.message_count)
     st.session_state.chat = chat
 
 
@@ -854,6 +883,11 @@ def main() -> None:
             icon=":material/group:",
             url_path="access-requests",
         ))
+    try:
+        start_summarizer(get_chat_store())
+    except Exception:
+        log.warning("summary thread not started", exc_info=True)  # retried next run
+
     page = st.navigation(pages)
     render_account()
     page.run()
