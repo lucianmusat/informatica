@@ -49,6 +49,42 @@ def test_user_lifecycle(store):
     assert [x.email for x in store.list_all()] == ["bob@example.com"]
 
 
+def test_chat_lifecycle(store):
+    import time
+
+    from chats import CassandraChatStore, Chat
+
+    chats = CassandraChatStore(store.session, KS, keep=2, pinned_max=1)
+    chats.ensure_schema()
+    owner = "bob@example.com"
+
+    def saved(question):
+        chat = Chat(owner=owner, messages=[{"role": "user", "content": question},
+                                           {"role": "assistant", "content": "ok"}])
+        chats.save(chat)
+        time.sleep(0.01)
+        return chat
+
+    first = saved("één")
+    assert chats.set_pinned(owner, first.chat_id, True)
+    others = [saved(f"q{i}") for i in range(3)]
+    assert not chats.set_pinned(owner, others[0].chat_id, True)  # cap of 1
+    assert [c.title for c in chats.list_for(owner)] == ["één", "q2", "q1"]
+
+    assert chats.set_summary(owner, others[2].chat_id, "about q2", 2)
+    chats.save(others[2])
+    loaded = chats.load(owner, others[2].chat_id)
+    assert loaded.messages[0]["content"] == "q2" and loaded.summary == "about q2"
+    assert any(c.chat_id == others[2].chat_id and c.message_count == 2
+               for c in chats.scan_for_summary())
+
+    chats.delete(owner, others[2].chat_id)
+    assert not chats.set_summary(owner, others[2].chat_id, "late", 2)
+    assert chats.load(owner, others[2].chat_id) is None
+    chats.delete_all(owner)
+    assert chats.list_for(owner) == []
+
+
 class FakeEmbeddings:
     """Deterministic vectors, so no Ollama is needed."""
 

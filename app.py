@@ -19,12 +19,15 @@ import conversation
 import rag
 from access import Access, check_access
 from notify import alert_new_user
+from chats import CassandraChatStore, Chat
 from users import APPROVED, BLOCKED, PENDING, CassandraUserStore
 from config import (
     ADMIN_EMAIL,
     CASSANDRA_HOSTS,
     CASSANDRA_KEYSPACE,
     CASSANDRA_PORT,
+    CHAT_HISTORY_KEEP,
+    CHAT_PINNED_MAX,
     EMBEDDER_MODEL,
     LLM_MODEL,
     LLM_MODEL_BIG,
@@ -125,6 +128,35 @@ def get_user_store() -> CassandraUserStore:
     store = CassandraUserStore(cluster.connect(), CASSANDRA_KEYSPACE)
     store.ensure_schema()
     return store
+
+
+@st.cache_resource(show_spinner=False)
+def get_chat_store() -> CassandraChatStore:
+    """Shares the user store's session (and its keyspace)."""
+    store = CassandraChatStore(
+        get_user_store().session, CASSANDRA_KEYSPACE,
+        keep=CHAT_HISTORY_KEEP, pinned_max=CHAT_PINNED_MAX,
+    )
+    store.ensure_schema()
+    return store
+
+
+def current_chat() -> Chat:
+    """The chat on screen. A new one lives only in the session until its first
+    answer is saved."""
+    chat = st.session_state.get("chat")
+    if chat is None or chat.owner != current_owner():
+        chat = st.session_state.chat = Chat(owner=current_owner())
+    return chat
+
+
+def save_chat(chat: Chat) -> None:
+    """Best effort: a Cassandra hiccup must not cost the user their answer."""
+    try:
+        get_chat_store().save(chat)
+    except Exception:
+        log.warning("could not save chat %s", chat.chat_id, exc_info=True)
+        st.toast("This chat could not be saved.", icon="⚠️")
 
 
 def current_owner() -> str:
@@ -367,7 +399,8 @@ def stream_reply(messages) -> tuple[str, Backend, dict]:
 
 def answer(question: str, mode: str) -> None:
     started = time.monotonic()  # the caption shows the whole wait, retrieval included
-    messages = st.session_state.messages
+    chat = current_chat()
+    messages = chat.messages
     index = len(messages)
 
     with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
@@ -376,9 +409,10 @@ def answer(question: str, mode: str) -> None:
     with turn("assistant", index + 1), st.chat_message("assistant", avatar=BOT_AVATAR):
         try:
             hits = gather_context(question, mode)
-            messages.append(conversation.user_message(
-                question, [(h.file_name, h.text, h.distance) for h in hits]))
-            payload = conversation.model_messages(messages[-MAX_HISTORY_MESSAGES:])
+            asked = conversation.user_message(question, [(h.file_name, h.text, h.distance) for h in hits])
+            # The question joins the chat only together with its answer, so a
+            # failed or interrupted answer leaves the chat as it was.
+            payload = conversation.model_messages((messages + [asked])[-MAX_HISTORY_MESSAGES:])
 
             reply, backend, metadata = stream_reply(payload)
             elapsed = time.monotonic() - started
@@ -388,8 +422,6 @@ def answer(question: str, mode: str) -> None:
         except Exception as exc:
             st.error(f"Something went wrong: {exc}", icon="⚠️")
             st.caption(traceback.format_exc())
-            if len(messages) > index:
-                messages.pop()
             return
 
     usage = conversation.usage_from(metadata)
@@ -400,7 +432,10 @@ def answer(question: str, mode: str) -> None:
         usage["prompt_seconds"], usage["output_tokens"], usage["output_seconds"],
         usage["load_seconds"], elapsed,
     )
+    messages.append(asked)
     messages.append({"role": "assistant", "content": reply, "caption": caption, "usage": usage})
+    chat.prompt_tokens = usage["prompt_tokens"]
+    save_chat(chat)
 
 
 def _hits(excerpts) -> list[rag.Hit]:
@@ -408,7 +443,7 @@ def _hits(excerpts) -> list[rag.Hit]:
 
 
 def replay_history() -> None:
-    messages = st.session_state.messages
+    messages = current_chat().messages
     for index, message in enumerate(messages):
         if message["role"] == "user":
             with turn("user", index), st.chat_message("user", avatar=USER_AVATAR):
@@ -484,9 +519,10 @@ def render_sidebar(client) -> str:
 
         st.divider()
 
-        if st.button("New chat", use_container_width=True):
-            st.session_state.messages = []
-            st.rerun()
+        st.button("New chat", use_container_width=True, on_click=_new_chat)
+        # Filled at the end of the run, after a new answer has been saved, so
+        # the list already includes it. See chat_page.
+        recent = st.empty()
 
         current = pick_backend()
         note = f" ({OLLAMA_BIG_NAME} warming up)" if big_status() == "warming" else ""
@@ -499,7 +535,79 @@ def render_sidebar(client) -> str:
         except Exception:
             st.caption("Weaviate · `unreachable`")
 
-    return mode
+    return mode, recent
+
+
+def _new_chat() -> None:
+    st.session_state.chat = Chat(owner=current_owner())
+
+
+def _open_chat(chat_id) -> None:
+    try:
+        chat = get_chat_store().load(current_owner(), chat_id)
+    except Exception as exc:
+        st.toast(f"Could not open that chat: {exc}", icon="⚠️")
+        return
+    if chat is None:
+        st.toast("That chat no longer exists.", icon="⚠️")
+        return
+    st.session_state.chat = chat
+
+
+def _delete_chat(chat_id) -> None:
+    try:
+        get_chat_store().delete(current_owner(), chat_id)
+    except Exception as exc:
+        st.toast(f"Could not delete that chat: {exc}", icon="⚠️")
+        return
+    if current_chat().chat_id == chat_id:
+        _new_chat()
+
+
+def _pin_chat(chat_id, pinned: bool) -> None:
+    try:
+        if not get_chat_store().set_pinned(current_owner(), chat_id, pinned):
+            st.toast(f"At most {CHAT_PINNED_MAX} chats can be pinned.", icon="📌")
+    except Exception as exc:
+        st.toast(f"Could not change the pin: {exc}", icon="⚠️")
+
+
+def render_recent_chats() -> None:
+    try:
+        chats = get_chat_store().list_for(current_owner())
+    except Exception as exc:
+        st.caption(f"Recent chats are unavailable ({type(exc).__name__}).")
+        return
+    if not chats:
+        return
+
+    open_id = current_chat().chat_id
+    pin_full = sum(c.pinned for c in chats) >= CHAT_PINNED_MAX
+    for heading, group in (("Pinned", [c for c in chats if c.pinned]),
+                           ("Recent chats", [c for c in chats if not c.pinned])):
+        if not group:
+            continue
+        st.caption(heading)
+        for info in group:
+            title, pin, remove = st.columns([6, 1, 1], vertical_alignment="center")
+            title.button(
+                info.title, key=f"chat-open-{info.chat_id}", on_click=_open_chat, args=(info.chat_id,),
+                # The open chat is the only one drawn as a button; the rest read as links.
+                type="secondary" if info.chat_id == open_id else "tertiary",
+                use_container_width=True,
+            )
+            pin.button(
+                "📌", key=f"chat-pin-{info.chat_id}", on_click=_pin_chat,
+                args=(info.chat_id, not info.pinned),
+                type="secondary" if info.pinned else "tertiary",
+                help="Unpin" if info.pinned else (
+                    f"At most {CHAT_PINNED_MAX} pinned chats" if pin_full else "Pin: keep this chat"),
+                disabled=pin_full and not info.pinned,
+            )
+            remove.button(
+                "✕", key=f"chat-rm-{info.chat_id}", on_click=_delete_chat, args=(info.chat_id,),
+                type="tertiary", help="Delete this chat",
+            )
 
 
 # --------------------------------------------------------------------------
@@ -554,7 +662,7 @@ def gate() -> Access:
     email = (st.user.get("email") or "").strip().lower()
     if st.session_state.get("user_email") != email:
         # A different account in the same browser session: start clean.
-        st.session_state.messages = []
+        st.session_state.pop("chat", None)
         st.session_state.pop("registered_for", None)
     st.session_state.user_email = email
 
@@ -593,6 +701,13 @@ def _when(ts) -> str:
 
 def _decide(email: str, status: str) -> None:
     get_user_store().set_status(email, status, ADMIN_EMAIL)
+    if status == BLOCKED:
+        # A blocked or revoked user's chats go with their access.
+        try:
+            get_chat_store().delete_all(email)
+        except Exception:
+            log.warning("could not delete the chats of %s", email, exc_info=True)
+            st.toast(f"{email}: blocked, but their chats could not be deleted.", icon="⚠️")
     st.toast(f"{email}: {status}")
 
 
@@ -657,9 +772,6 @@ def pending_count() -> int:
 # --------------------------------------------------------------------------
 
 def chat_page() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
     try:
         client = get_weaviate_client()
     except WeaviateConnectionError:
@@ -670,7 +782,7 @@ def chat_page() -> None:
         )
         return
 
-    mode = render_sidebar(client)
+    mode, recent = render_sidebar(client)
 
     # st.chat_input pins itself to the bottom wherever it is called, so reading
     # it first lets this run know a question is incoming and skip the greeting.
@@ -682,7 +794,7 @@ def chat_page() -> None:
     # Streamlit leaves the greeting's old heading and caption inside it, faded,
     # until the whole answer has streamed.
     welcome = st.empty()
-    if not st.session_state.messages and not question:
+    if not current_chat().messages and not question:
         # Keyed so the stylesheet can centre the whole block; see html_templates.
         with welcome.container(key="welcome"):
             st.image(LOGO, width=76)
@@ -696,6 +808,9 @@ def chat_page() -> None:
 
     if question and question.strip():
         answer(question.strip(), mode)
+
+    with recent.container():
+        render_recent_chats()
 
 
 def main() -> None:

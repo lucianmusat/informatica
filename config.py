@@ -56,6 +56,11 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 # How many prior turns to replay to the model each request.
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 
+# Saved chats: every pinned chat (up to CHAT_PINNED_MAX) plus the
+# CHAT_HISTORY_KEEP most recently used unpinned ones.
+CHAT_HISTORY_KEEP = int(os.getenv("CHAT_HISTORY_KEEP", "5"))
+CHAT_PINNED_MAX = int(os.getenv("CHAT_PINNED_MAX", "20"))
+
 # --------------------------------------------------------------------------
 # Access control
 # --------------------------------------------------------------------------
