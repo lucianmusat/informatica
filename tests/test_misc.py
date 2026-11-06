@@ -48,3 +48,15 @@ def test_llm_reasoning_parsing(monkeypatch):
     finally:
         monkeypatch.delenv("LLM_REASONING", raising=False)
         importlib.reload(config)
+
+
+def test_format_duration():
+    from timing import format_duration
+
+    assert format_duration(0.84) == "0.8s"
+    assert format_duration(9.94) == "9.9s"
+    assert format_duration(12.3) == "12s"
+    assert format_duration(59.4) == "59s"
+    assert format_duration(59.6) == "1m 00s"
+    assert format_duration(75) == "1m 15s"
+    assert format_duration(3605) == "60m 05s"

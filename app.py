@@ -52,6 +52,7 @@ from config import (
 )
 from html_templates import DISMISS_KEYBOARD_ON_SEND, THINKING_INDICATOR, TYPING_INDICATOR, css
 from pdf_utils import extract_documents
+from timing import format_duration
 
 LOGO = "static/logo.png"
 BOT_AVATAR = "static/bot.png"
@@ -349,6 +350,7 @@ def stream_reply(messages) -> tuple[str, Backend]:
 
 
 def answer(question: str, mode: str) -> None:
+    started = time.monotonic()  # the caption shows the whole wait, retrieval included
     index = len(st.session_state.messages)
     st.session_state.messages.append(HumanMessage(content=question))
 
@@ -362,7 +364,8 @@ def answer(question: str, mode: str) -> None:
             payload += st.session_state.messages[-MAX_HISTORY_MESSAGES:]
 
             reply, backend = stream_reply(payload)
-            st.caption(backend_label(backend))
+            caption = f"{backend_label(backend)} · {format_duration(time.monotonic() - started)}"
+            st.caption(caption)
             render_sources(hits)
         except Exception as exc:
             st.error(f"Something went wrong: {exc}", icon="⚠️")
@@ -375,7 +378,7 @@ def answer(question: str, mode: str) -> None:
             content=reply,
             additional_kwargs={
                 "sources": [(h.file_name, h.text, h.distance) for h in hits],
-                "backend": backend_label(backend),
+                "backend": caption,
             },
         )
     )
